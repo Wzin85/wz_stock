@@ -31,7 +31,6 @@ Rules:
 - Include 2-3 BULL lines and 1-2 BEAR lines
 - No quotes, no special characters, SUMMARY is one Korean sentence`;
 
-const SWING5 = ["NVDA", "TSLA", "AMD", "META", "AAPL"];
 const REC_PRIORITY = { BUY: 0, HOLD: 1, SELL: 2 };
 
 const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
@@ -253,6 +252,29 @@ export default function App() {
   const [expanded, setExpanded] = useState(null);
   const [error, setError] = useState(null);
   const [fng, setFng] = useState(null);
+  const [positions, setPositions] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("wz_positions") || "[]"); }
+    catch { return []; }
+  });
+  const [showPos, setShowPos] = useState(false);
+  const [newPos, setNewPos] = useState({ ticker: "", entry: "", stop: "" });
+
+  const savePositions = (next) => {
+    setPositions(next);
+    try { localStorage.setItem("wz_positions", JSON.stringify(next)); } catch {}
+  };
+
+  const addPosition = () => {
+    const t = newPos.ticker.trim().toUpperCase();
+    const entry = parseFloat(newPos.entry), stop = parseFloat(newPos.stop);
+    if (!t || isNaN(entry)) { setError("티커와 진입가를 입력해주세요"); return; }
+    if (positions.some(p => p.ticker === t)) { setError(`${t}는 이미 보유 목록에 있어요`); return; }
+    setError(null);
+    savePositions([...positions, { ticker: t, side: "BUY", entry, stop: isNaN(stop) ? null : stop, date: new Date().toISOString().slice(0, 10) }]);
+    setNewPos({ ticker: "", entry: "", stop: "" });
+  };
+
+  const removePosition = (t) => savePositions(positions.filter(p => p.ticker !== t));
 
   useEffect(() => {
     fetch("https://feargreedchart.com/api/?action=all")
@@ -260,6 +282,11 @@ export default function App() {
       .then(d => { if (d?.score?.score != null) setFng(d.score.score); })
       .catch(() => {});
   }, []);
+
+  const analyzePositions = () => {
+    if (!positions.length) { setError("보유 종목이 없어요. 먼저 추가해주세요"); return; }
+    runAnalysis(positions.map(p => p.ticker));
+  };
 
   const runAnalysis = async (symbols) => {
     if (!tdKey.trim()) { setError("Twelve Data API 키를 입력해주세요"); return; }
@@ -271,7 +298,21 @@ export default function App() {
     const collected = [];
     for (let i = 0; i < syms.length; i++) {
       setProgress({ cur: i + 1, total: syms.length, sym: syms[i] });
-      try { collected.push(await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng)); }
+      try {
+        const res = await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng);
+        const pos = positions.find(p => p.ticker === syms[i]);
+        if (pos) {
+          const pnlPct = ((res.current_price - pos.entry) / pos.entry) * 100;
+          const stopBroken = pos.stop != null && res.current_price <= pos.stop;
+          let status;
+          if (res.recommendation === "BUY") status = { txt: "신호 유효 · 보유 지속", col: "#00e5a0" };
+          else if (stopBroken) status = { txt: "손절가 도달 · 청산 검토", col: "#ff4757" };
+          else if (res.recommendation === "SELL") status = { txt: "신호 약화 · 손절선은 유효 (룰상 보유)", col: "#ffb830" };
+          else status = { txt: "중립 전환 · 손절선 유효", col: "#ffb830" };
+          res.position = { ...pos, pnlPct, stopBroken, status };
+        }
+        collected.push(res);
+      }
       catch (e) { collected.push({ ticker: syms[i], error: true, errMsg: e.message }); }
       const sorted = [...collected].sort((a, b) => {
         const pa = a.error ? 9 : REC_PRIORITY[a.recommendation] ?? 5;
@@ -360,10 +401,37 @@ export default function App() {
           <button style={s.btn} onClick={() => runAnalysis(input.split(/[,\s]+/))} disabled={analyzing}>
             {analyzing ? `분석 중 ${progress.cur}/${progress.total} · ${progress.sym}` : "ANALYZE"}
           </button>
-          <button style={s.btn2} onClick={() => { if (!analyzing) { setInput(SWING5.join(", ")); runAnalysis(SWING5); } }} disabled={analyzing}>
-            스윙 추천 5
+          <button style={s.btn2} onClick={() => setShowPos(v => !v)} disabled={analyzing}>
+            내 포지션 {positions.length > 0 ? `(${positions.length})` : ""} {showPos ? "▴" : "▾"}
           </button>
         </div>
+
+        {showPos && (
+          <div style={{ ...s.card, padding: "14px 16px" }}>
+            <div style={{ ...s.lbl, marginBottom: "10px" }}>보유 종목</div>
+            {positions.length === 0 && <div style={{ fontSize: "11px", color: "#334d66", marginBottom: "12px" }}>아직 등록된 보유 종목이 없어요</div>}
+            {positions.map(p => (
+              <div key={p.ticker} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: "1px solid #121c2a", fontSize: "11px" }}>
+                <span style={{ fontWeight: "700", minWidth: "52px" }}>{p.ticker}</span>
+                <span style={{ flex: 1, color: "#607d9f" }}>진입 ${p.entry}{p.stop != null ? ` · 손절 $${p.stop}` : ""}</span>
+                <span onClick={() => removePosition(p.ticker)} style={{ color: "#ff4757", cursor: "pointer", padding: "2px 8px", fontWeight: "700" }}>×</span>
+              </div>
+            ))}
+            <div style={{ display: "flex", gap: "6px", marginTop: "12px" }}>
+              <input value={newPos.ticker} onChange={e => setNewPos({ ...newPos, ticker: e.target.value })}
+                placeholder="티커" style={{ ...s.inp("np1"), marginBottom: 0, flex: "1.2", fontSize: "12px", padding: "9px 10px", textTransform: "uppercase" }} />
+              <input value={newPos.entry} onChange={e => setNewPos({ ...newPos, entry: e.target.value })}
+                placeholder="진입가" inputMode="decimal" style={{ ...s.inp("np2"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
+              <input value={newPos.stop} onChange={e => setNewPos({ ...newPos, stop: e.target.value })}
+                placeholder="손절가" inputMode="decimal" style={{ ...s.inp("np3"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
+            </div>
+            <div style={{ display: "flex", gap: "6px", marginTop: "8px" }}>
+              <button style={{ ...s.btn2, flex: 1 }} onClick={addPosition} disabled={analyzing}>+ 추가</button>
+              <button style={{ ...s.btn, flex: 1.5 }} onClick={analyzePositions} disabled={analyzing}>보유 전체 분석</button>
+            </div>
+            <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px" }}>※ 이 기기 브라우저에만 저장돼요 (캐시 삭제 시 사라짐)</div>
+          </div>
+        )}
 
         {analyzing && (
           <div style={{ height: "2px", background: "#182434", borderRadius: "1px", overflow: "hidden", marginBottom: "20px" }}>
@@ -397,7 +465,9 @@ export default function App() {
               <div style={{ ...s.row, borderColor: open ? rc + "55" : "#182434", marginBottom: open ? 0 : "8px" }} onClick={() => setExpanded(open ? null : r.ticker)}>
                 <div style={{ minWidth: "62px" }}>
                   <div style={{ fontWeight: "700", fontSize: "15px", letterSpacing: "1px" }}>
-                    {r.ticker}{r.earnings && r.earnings.days <= 14 && <span style={{ color: "#ff8c42", fontSize: "10px", marginLeft: "4px" }}>⚠</span>}
+                    {r.ticker}
+                    {r.position && <span style={{ color: r.position.status.col, fontSize: "8px", marginLeft: "5px", border: `1px solid ${r.position.status.col}55`, borderRadius: "2px", padding: "1px 4px", verticalAlign: "middle" }}>보유</span>}
+                    {r.earnings && r.earnings.days <= 14 && <span style={{ color: "#ff8c42", fontSize: "10px", marginLeft: "4px" }}>⚠</span>}
                   </div>
                   <div style={{ color: "#334d66", fontSize: "9px" }}>{r.company_name}</div>
                 </div>
@@ -416,6 +486,22 @@ export default function App() {
 
               {open && (
                 <div style={{ ...s.card, borderColor: rc + "33", borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
+                  {r.position && (
+                    <div style={{ marginBottom: "10px", padding: "10px 12px", borderRadius: "3px", background: r.position.status.col + "12", border: `1px solid ${r.position.status.col}44` }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+                        <span style={{ fontSize: "10px", color: r.position.status.col, fontWeight: "700" }}>보유 중 (진입 ${r.position.entry})</span>
+                        <span style={{ fontSize: "11px", fontWeight: "700", color: r.position.pnlPct >= 0 ? "#00e5a0" : "#ff4757" }}>
+                          {r.position.pnlPct >= 0 ? "+" : ""}{r.position.pnlPct.toFixed(1)}%
+                        </span>
+                      </div>
+                      <div style={{ fontSize: "10px", color: r.position.status.col }}>→ {r.position.status.txt}</div>
+                      {r.position.stop != null && (
+                        <div style={{ fontSize: "9px", color: "#607d9f", marginTop: "3px" }}>
+                          손절가 ${r.position.stop} {r.position.stopBroken ? "· 🔴 도달" : "· 유효"}
+                        </div>
+                      )}
+                    </div>
+                  )}
                   <div style={{ fontSize: "12px", lineHeight: "1.7", color: "#b0c4d8", marginBottom: "4px" }}>{r.summary}</div>
                   <div style={{ fontSize: "8px", color: "#334d66", marginBottom: "8px" }}>데이터 기준일: {r.data_date}</div>
 
@@ -484,6 +570,19 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+
+                  {!r.position && (
+                    <button
+                      style={{ ...s.btn2, width: "100%", marginTop: "12px", boxSizing: "border-box" }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (positions.some(p => p.ticker === r.ticker)) { setError(`${r.ticker}는 이미 보유 목록에 있어요`); return; }
+                        setError(null);
+                        savePositions([...positions, { ticker: r.ticker, side: "BUY", entry: r.current_price, stop: r.stop_loss, date: new Date().toISOString().slice(0, 10) }]);
+                      }}>
+                      + 보유 등록 (진입 ${r.current_price?.toFixed(2)} · 손절 ${r.stop_loss})
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -499,4 +598,3 @@ export default function App() {
     </div>
   );
 }
-
