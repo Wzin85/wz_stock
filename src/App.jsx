@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 const INTERPRET_PROMPT = `You are a professional swing trading analyst. You are given PRE-CALCULATED technical indicators computed from REAL daily price data. Trust these numbers completely — do not recalculate or doubt them. Provide a swing trading interpretation (holding period: days to a few weeks).
 
@@ -22,6 +22,7 @@ Rules:
 - BE DECISIVE: Reserve HOLD ONLY for setups where signals genuinely conflict with no clear edge. When evidence tilts one way even moderately, commit to BUY or SELL and express strength via CONFIDENCE (4-5 weak, 7-9 strong). Do NOT default to HOLD.
 - ALL text (SUMMARY, BULL, BEAR, COMPANY) MUST be natural Korean
 - TARGET_PRICE and STOP_LOSS: realistic levels near current price, informed by the Bollinger bands and recent range provided
+- If a Market Fear & Greed Index is given, factor it into your judgment: extreme fear can signal contrarian buying opportunity but also elevated risk; extreme greed warrants caution about overheating. Reflect this in CONFIDENCE and mention it in SUMMARY or a BULL/BEAR point when relevant.
 - ENTRY_ZONE: a price range near current price / support
 - CONFIDENCE is a number 1-10
 - Include 2-3 BULL lines and 1-2 BEAR lines
@@ -148,7 +149,7 @@ function parseInterpret(text) {
   };
 }
 
-async function analyzeOne(sym, tdKey, anthropicKey) {
+async function analyzeOne(sym, tdKey, anthropicKey, fng) {
   const url = `https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=120&apikey=${tdKey}`;
   const res = await fetch(url);
   const td = await res.json();
@@ -166,6 +167,7 @@ Price vs VWAP(20): ${ind.indicators.vwap.note} (${ind.indicators.vwap.status})
 Bollinger Bands(20,2): upper ${r.bb.upper.toFixed(2)}, middle ${r.bb.middle.toFixed(2)}, lower ${r.bb.lower.toFixed(2)} -> price at ${ind.indicators.bollinger.position}
 Volume: ${Math.round(r.volRatio * 100)}% of 20-day average (${ind.indicators.volume.signal})
 MA20: ${r.ma20.toFixed(2)} (price ${ind.indicators.trend.short}), MA50: ${r.ma50.toFixed(2)} (price ${ind.indicators.trend.medium})
+${fng != null ? `\nMarket Fear & Greed Index: ${fng}/100 (${fng <= 25 ? "Extreme Fear" : fng <= 45 ? "Fear" : fng <= 55 ? "Neutral" : fng <= 75 ? "Greed" : "Extreme Greed"}) — overall market sentiment, use as context for risk` : ""}
 
 Interpret this for swing trading.`;
 
@@ -200,6 +202,14 @@ export default function App() {
   const [results, setResults] = useState([]);
   const [expanded, setExpanded] = useState(null);
   const [error, setError] = useState(null);
+  const [fng, setFng] = useState(null);
+
+  useEffect(() => {
+    fetch("https://feargreedchart.com/api/?action=all")
+      .then(r => r.json())
+      .then(d => { if (d?.score?.score != null) setFng(d.score.score); })
+      .catch(() => {});
+  }, []);
 
   const runAnalysis = async (symbols) => {
     if (!tdKey.trim()) { setError("Twelve Data API 키를 입력해주세요"); return; }
@@ -211,7 +221,7 @@ export default function App() {
     const collected = [];
     for (let i = 0; i < syms.length; i++) {
       setProgress({ cur: i + 1, total: syms.length, sym: syms[i] });
-      try { collected.push(await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim())); }
+      try { collected.push(await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng)); }
       catch (e) { collected.push({ ticker: syms[i], error: true, errMsg: e.message }); }
       const sorted = [...collected].sort((a, b) => {
         const pa = a.error ? 9 : REC_PRIORITY[a.recommendation] ?? 5;
@@ -263,6 +273,22 @@ export default function App() {
           <div style={s.title}>WZ STOCK</div>
           <div style={s.sub}>실제 데이터 기반 스윙 분석</div>
         </div>
+
+        {fng != null && (() => {
+          const lbl = fng <= 25 ? "극공포" : fng <= 45 ? "공포" : fng <= 55 ? "중립" : fng <= 75 ? "탐욕" : "극탐욕";
+          const col = fng <= 25 ? "#ff4757" : fng <= 45 ? "#ff8c42" : fng <= 55 ? "#607d9f" : fng <= 75 ? "#7ed957" : "#00e5a0";
+          return (
+            <div style={{ background: "#0b1522", border: `1px solid ${col}33`, borderRadius: "3px", padding: "12px 16px", marginBottom: "16px" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "8px" }}>
+                <span style={{ fontSize: "9px", letterSpacing: "2px", color: "#334d66" }}>시장 공포·탐욕 지수</span>
+                <span style={{ fontSize: "18px", fontWeight: "700", color: col }}>{fng} · {lbl}</span>
+              </div>
+              <div style={{ position: "relative", height: "5px", borderRadius: "3px", background: "linear-gradient(to right, #ff4757, #ff8c42, #607d9f, #7ed957, #00e5a0)" }}>
+                <div style={{ position: "absolute", left: `${fng}%`, top: "-3px", width: "2px", height: "11px", background: "#fff", transform: "translateX(-1px)", borderRadius: "1px" }} />
+              </div>
+            </div>
+          );
+        })()}
 
         <input style={s.inp("a")} type="password" value={anthropicKey}
           onChange={e => setAnthropicKey(e.target.value)}
