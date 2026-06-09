@@ -178,7 +178,7 @@ Interpret this for swing trading.`;
       "anthropic-dangerous-direct-browser-access": "true",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514", max_tokens: 800, temperature: 0.4,
+      model: "claude-sonnet-4-6", max_tokens: 800, temperature: 0.4,
       system: INTERPRET_PROMPT, messages: [{ role: "user", content: userMsg }],
     }),
   });
