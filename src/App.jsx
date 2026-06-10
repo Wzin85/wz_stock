@@ -270,11 +270,17 @@ export default function App() {
     if (!t || isNaN(entry)) { setError("티커와 진입가를 입력해주세요"); return; }
     if (positions.some(p => p.ticker === t)) { setError(`${t}는 이미 보유 목록에 있어요`); return; }
     setError(null);
-    savePositions([...positions, { ticker: t, side: "BUY", entry, stop: isNaN(stop) ? null : stop, date: new Date().toISOString().slice(0, 10) }]);
+    savePositions([...positions, { ticker: t, side: "BUY", entry, stop: isNaN(stop) ? null : stop, target: null, date: new Date().toISOString().slice(0, 10) }]);
     setNewPos({ ticker: "", entry: "", stop: "" });
   };
 
   const removePosition = (t) => savePositions(positions.filter(p => p.ticker !== t));
+
+  const updatePositionLevels = (ticker, newStop, newTarget) => {
+    savePositions(positions.map(p =>
+      p.ticker === ticker ? { ...p, stop: newStop, target: newTarget } : p
+    ));
+  };
 
   useEffect(() => {
     fetch("https://feargreedchart.com/api/?action=all")
@@ -460,6 +466,7 @@ export default function App() {
             </div>
           );
           const open = expanded === r.ticker, rc = recColor(r.recommendation);
+          const livePos = r.position ? positions.find(p => p.ticker === r.ticker) : null;
           return (
             <div key={idx}>
               <div style={{ ...s.row, borderColor: open ? rc + "55" : "#182434", marginBottom: open ? 0 : "8px" }} onClick={() => setExpanded(open ? null : r.ticker)}>
@@ -495,9 +502,22 @@ export default function App() {
                         </span>
                       </div>
                       <div style={{ fontSize: "10px", color: r.position.status.col }}>→ {r.position.status.txt}</div>
-                      {r.position.stop != null && (
+                      {livePos?.stop != null && (
                         <div style={{ fontSize: "9px", color: "#607d9f", marginTop: "3px" }}>
-                          손절가 ${r.position.stop} {r.position.stopBroken ? "· 🔴 도달" : "· 유효"}
+                          손절가 ${livePos.stop} {r.current_price <= livePos.stop ? "· 🔴 도달" : "· 유효"}
+                          {livePos.target != null ? ` · 목표가 $${livePos.target}` : ""}
+                        </div>
+                      )}
+                      {livePos && (livePos.stop !== r.stop_loss || livePos.target !== r.target_price) && (
+                        <div style={{ marginTop: "8px", paddingTop: "8px", borderTop: `1px solid ${r.position.status.col}22` }}>
+                          <div style={{ fontSize: "9px", color: "#dce8f5", marginBottom: "6px" }}>
+                            새 분석값: 손절 ${r.stop_loss} · 목표 ${r.target_price}
+                          </div>
+                          <button
+                            style={{ ...s.btn2, width: "100%", boxSizing: "border-box", color: "#00e5a0", borderColor: "#00e5a055" }}
+                            onClick={(e) => { e.stopPropagation(); updatePositionLevels(r.ticker, r.stop_loss, r.target_price); }}>
+                            ↻ 손절·목표가 새 분석값으로 적용
+                          </button>
                         </div>
                       )}
                     </div>
@@ -578,7 +598,7 @@ export default function App() {
                         e.stopPropagation();
                         if (positions.some(p => p.ticker === r.ticker)) { setError(`${r.ticker}는 이미 보유 목록에 있어요`); return; }
                         setError(null);
-                        savePositions([...positions, { ticker: r.ticker, side: "BUY", entry: r.current_price, stop: r.stop_loss, date: new Date().toISOString().slice(0, 10) }]);
+                        savePositions([...positions, { ticker: r.ticker, side: "BUY", entry: r.current_price, stop: r.stop_loss, target: r.target_price, date: new Date().toISOString().slice(0, 10) }]);
                       }}>
                       + 보유 등록 (진입 ${r.current_price?.toFixed(2)} · 손절 ${r.stop_loss})
                     </button>
