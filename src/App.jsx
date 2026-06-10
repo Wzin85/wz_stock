@@ -1,4 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { createChart, CandlestickSeries, LineSeries, HistogramSeries } from "lightweight-charts";
 
 const INTERPRET_PROMPT = `You are a seasoned swing trading STRATEGIST (not a checklist analyst). You receive PRE-CALCULATED indicators from REAL daily price data — trust these numbers, never recalculate. Your job is not to "score" indicators but to think like a risk manager: weave the signals into a coherent picture, decide how to protect capital first and capture upside second, and form a concrete plan. Holding horizon: days to a few weeks.
 
@@ -99,6 +100,94 @@ function calcBollinger(closes, period = 20, mult = 2) {
   return { upper: m + mult * sd, middle: m, lower: m - mult * sd };
 }
 
+// RSI 시리즈 (각 날짜별 RSI 값 배열)
+function calcRSISeries(closes, period = 14) {
+  const out = new Array(closes.length).fill(null);
+  if (closes.length < period + 1) return out;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const ch = closes[i] - closes[i - 1];
+    if (ch >= 0) gains += ch; else losses -= ch;
+  }
+  let ag = gains / period, al = losses / period;
+  out[period] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+  for (let i = period + 1; i < closes.length; i++) {
+    const ch = closes[i] - closes[i - 1];
+    ag = (ag * (period - 1) + (ch > 0 ? ch : 0)) / period;
+    al = (al * (period - 1) + (ch < 0 ? -ch : 0)) / period;
+    out[i] = al === 0 ? 100 : 100 - 100 / (1 + ag / al);
+  }
+  return out;
+}
+
+// RSI 다이버전스 감지
+function detectRSIDivergence(highs, lows, closes, n = 3) {
+  const rsiSeries = calcRSISeries(closes, 14);
+  const len = closes.length;
+  const start = Math.max(n, len - 60); // 최근 60일만 탐색
+  const sH = [], sL = [];
+  for (let i = start; i < len - n; i++) {
+    if (rsiSeries[i] == null) continue;
+    let isH = true, isL = true;
+    for (let j = i - n; j <= i + n; j++) {
+      if (j === i) continue;
+      if (highs[j] >= highs[i]) isH = false;
+      if (lows[j] <= lows[i]) isL = false;
+    }
+    if (isH) sH.push({ price: highs[i], rsi: rsiSeries[i] });
+    if (isL) sL.push({ price: lows[i], rsi: rsiSeries[i] });
+  }
+  // 약세 다이버전스: 가격 고점↑ but RSI 고점↓
+  if (sH.length >= 2) {
+    const [p, c] = sH.slice(-2);
+    if (c.price > p.price && c.rsi < p.rsi - 2)
+      return { type: "bearish", note: `약세 다이버전스: 가격 고점 $${p.price.toFixed(1)}→$${c.price.toFixed(1)} (상승), RSI 고점 ${p.rsi.toFixed(0)}→${c.rsi.toFixed(0)} (하락) — 상승 모멘텀 약화, 반전 경계` };
+  }
+  // 강세 다이버전스: 가격 저점↓ but RSI 저점↑
+  if (sL.length >= 2) {
+    const [p, c] = sL.slice(-2);
+    if (c.price < p.price && c.rsi > p.rsi + 2)
+      return { type: "bullish", note: `강세 다이버전스: 가격 저점 $${p.price.toFixed(1)}→$${c.price.toFixed(1)} (하락), RSI 저점 ${p.rsi.toFixed(0)}→${c.rsi.toFixed(0)} (상승) — 하락 모멘텀 약화, 반등 가능성` };
+  }
+  return { type: "none", note: "최근 60일 내 RSI 다이버전스 없음" };
+}
+
+// 거래량 품질 분석 (상승일 vs 하락일 거래량)
+function analyzeVolumePattern(closes, vols) {
+  const n = Math.min(20, closes.length - 1);
+  const start = closes.length - n;
+  let upV = 0, upD = 0, dnV = 0, dnD = 0;
+  for (let i = start; i < closes.length; i++) {
+    if (closes[i] > closes[i - 1]) { upV += vols[i]; upD++; }
+    else if (closes[i] < closes[i - 1]) { dnV += vols[i]; dnD++; }
+  }
+  const avgUp = upD ? upV / upD : 0, avgDn = dnD ? dnV / dnD : 0;
+  const ratio = avgDn > 0 ? avgUp / avgDn : 2;
+  const half = Math.floor(n / 2);
+  const v1 = vols.slice(start, start + half).reduce((a, b) => a + b, 0) / half;
+  const v2 = vols.slice(start + half).reduce((a, b) => a + b, 0) / (n - half);
+  const trend = v2 > v1 * 1.1 ? "증가" : v2 < v1 * 0.9 ? "감소" : "안정";
+  const quality = ratio >= 1.5 ? "강한 매수세 우위" : ratio >= 1.1 ? "매수세 우위" : ratio <= 0.67 ? "강한 매도세 우위" : ratio <= 0.9 ? "매도세 우위" : "균형";
+  return {
+    ratio: Math.round(ratio * 100) / 100, quality, volTrend: trend,
+    note: `상승일 평균 ${(avgUp / 1e6).toFixed(1)}M vs 하락일 ${(avgDn / 1e6).toFixed(1)}M (${ratio.toFixed(1)}x) → ${quality} · 거래량 ${trend} 추세`,
+  };
+}
+
+// 52주 위치
+function calc52WeekPos(highs, lows, closes) {
+  const lb = Math.min(252, highs.length);
+  const h52 = Math.max(...highs.slice(-lb)), l52 = Math.min(...lows.slice(-lb));
+  const cur = closes[closes.length - 1];
+  const range = h52 - l52;
+  const pos = range > 0 ? Math.round(((cur - l52) / range) * 100) : 50;
+  const fromH = Math.round(((cur - h52) / h52) * 1000) / 10;
+  const fromL = Math.round(((cur - l52) / l52) * 1000) / 10;
+  const zone = pos >= 90 ? "52주 고점 근접 (상위 10%)" : pos >= 75 ? "상위권" : pos >= 50 ? "중상위권" : pos >= 25 ? "중하위권" : "52주 저점 근접 (하위 25%)";
+  const breakout = fromH > -3; // 52주 고점 3% 이내 = 잠재적 돌파
+  return { pos, fromH, fromL, h52, l52, zone, breakout, note: `52주 범위 내 ${pos}% 위치 (${zone}) · 고점 $${h52.toFixed(0)} 대비 ${fromH}% · 저점 $${l52.toFixed(0)} 대비 +${fromL}%${breakout ? " · ⚡ 52주 고점 돌파 구간" : ""}` };
+}
+
 function calcVWAP(highs, lows, closes, vols, period = 20) {
   const start = Math.max(0, closes.length - period);
   let pv = 0, v = 0;
@@ -107,6 +196,38 @@ function calcVWAP(highs, lows, closes, vols, period = 20) {
     pv += tp * vols[i]; v += vols[i];
   }
   return pv / v;
+}
+
+function calcSwingLevels(highs, lows, cur, n = 3) {
+  const ph = [], pl = [];
+  const len = highs.length;
+  for (let i = n; i < len - n; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = i - n; j <= i + n; j++) {
+      if (j === i) continue;
+      if (highs[j] >= highs[i]) isHigh = false;
+      if (lows[j] <= lows[i]) isLow = false;
+    }
+    if (isHigh) ph.push(highs[i]);
+    if (isLow) pl.push(lows[i]);
+  }
+  const cluster = (prices) => {
+    if (!prices.length) return [];
+    const sorted = [...prices].sort((a, b) => a - b);
+    const groups = [[sorted[0]]];
+    for (let i = 1; i < sorted.length; i++) {
+      const last = groups[groups.length - 1];
+      if ((sorted[i] - last[0]) / last[0] < 0.015) last.push(sorted[i]);
+      else groups.push([sorted[i]]);
+    }
+    return groups.map(g => ({ price: g.reduce((a, b) => a + b, 0) / g.length, strength: g.length }));
+  };
+  let res = cluster(ph).filter(l => l.price > cur).sort((a, b) => a.price - b.price);
+  let sup = cluster(pl).filter(l => l.price < cur).sort((a, b) => b.price - a.price);
+  if (!res.length) res = [{ price: Math.max(...highs.slice(-60)), strength: 1 }];
+  if (!sup.length) sup = [{ price: Math.min(...lows.slice(-60)), strength: 1 }];
+  const addDist = (arr, above) => arr.map(l => ({ ...l, dist: above ? (l.price - cur) / cur * 100 : (cur - l.price) / cur * 100 }));
+  return { resistances: addDist(res, true).slice(0, 3), supports: addDist(sup, false).slice(0, 3) };
 }
 
 function computeIndicators(values) {
@@ -144,14 +265,12 @@ function computeIndicators(values) {
   const trendMed = cur >= ma50 ? "up" : "down";
   const trendNote = `20일선 ${trendShort === "up" ? "위" : "아래"} / 50일선 ${trendMed === "up" ? "위" : "아래"}`;
 
-  // ② 지지/저항선 (최근 60일 스윙 고저점)
-  const lookback = Math.min(60, n);
-  const recentHigh = Math.max(...highs.slice(-lookback));
-  const recentLow = Math.min(...lows.slice(-lookback));
-  const resistDist = ((recentHigh - cur) / cur) * 100;
-  const supportDist = ((cur - recentLow) / cur) * 100;
-  const levels = { resistance: recentHigh, support: recentLow, resistDist, supportDist };
-  const levelNote = `저항 $${recentHigh.toFixed(0)} (+${resistDist.toFixed(1)}%) / 지지 $${recentLow.toFixed(0)} (-${supportDist.toFixed(1)}%)`;
+  // ② 지지/저항선 (스윙 피벗 기반 다중 레벨)
+  const swingLevels = calcSwingLevels(highs, lows, cur);
+  const levelNote = [
+    ...swingLevels.resistances.slice(0, 2).map((l, i) => `R${i + 1} $${l.price.toFixed(1)} (+${l.dist.toFixed(1)}%${l.strength > 1 ? ` ×${l.strength}` : ""})`),
+    ...swingLevels.supports.slice(0, 2).map((l, i) => `S${i + 1} $${l.price.toFixed(1)} (-${l.dist.toFixed(1)}%${l.strength > 1 ? ` ×${l.strength}` : ""})`),
+  ].join(" / ");
 
   // ③ 거래량+가격 동반 (최근 10일, 고가·저가·꼬리 반영 = 차이킨 A/D 방식)
   const vpLook = Math.min(10, n);
@@ -183,12 +302,16 @@ function computeIndicators(values) {
   }
   const atr = trSum / atrLook;
   const atrPct = (atr / cur) * 100;
-  // 변동성 기반 권장 손절: 현재가 - 2×ATR
   const atrStop = cur - 2 * atr;
+
+  // ④ 심화 분석
+  const rsiDiv = detectRSIDivergence(highs, lows, closes);
+  const volPattern = analyzeVolumePattern(closes, vols);
+  const pos52w = calc52WeekPos(highs, lows, closes);
 
   return {
     current_price: cur, price_change_pct: changePct, data_date: data[n - 1].datetime,
-    raw: { rsi, macd, bb, vwap, vwapPct, volRatio, ma20, ma50, levels, atr, atrPct, atrStop },
+    raw: { rsi, macd, bb, vwap, vwapPct, volRatio, ma20, ma50, swingLevels, atr, atrPct, atrStop },
     indicators: {
       rsi: { value: Math.round(rsi * 10) / 10, signal: rsiSig, note: rsiNote },
       macd: { signal: macdSig, note: macdNote },
@@ -196,9 +319,12 @@ function computeIndicators(values) {
       bollinger: { position: bollPos, note: bollNote },
       volume: { ratio: Math.round(volRatio * 100) / 100, signal: volSig, note: volNote },
       trend: { short: trendShort, medium: trendMed, note: trendNote },
-      levels: { note: levelNote },
+      levels: { swingLevels, note: levelNote },
       volprice: { signal: vpSig, note: vpNote },
       atr: { value: Math.round(atr * 100) / 100, pct: atrPct, stop: atrStop, note: `ATR ${atrPct.toFixed(1)}% · 권장손절 $${atrStop.toFixed(2)} (2×ATR)` },
+      rsiDiv,
+      volPattern,
+      pos52w,
     },
   };
 }
@@ -236,15 +362,43 @@ async function fetchEarningsDays(sym, tdKey) {
   } catch { return null; }
 }
 
+function computeWeeklyIndicators(values) {
+  if (!values || values.length < 10) return null;
+  const data = [...values].reverse();
+  const closes = data.map(d => parseFloat(d.close));
+  const n = closes.length;
+  const cur = closes[n - 1];
+  const ma10 = closes.length >= 10 ? avg(closes.slice(-10)) : null;
+  const ma20 = closes.length >= 20 ? avg(closes.slice(-20)) : null;
+  const rsi = calcRSI(closes, 14);
+  const macdW = calcMACD(closes);
+  const aboveMa10 = ma10 != null && cur > ma10;
+  const aboveMa20 = ma20 != null && cur > ma20;
+  const trend = aboveMa10 && aboveMa20 ? "uptrend" : !aboveMa10 && !aboveMa20 ? "downtrend" : "mixed";
+  const trendKr = trend === "uptrend" ? "상승추세" : trend === "downtrend" ? "하락추세" : "혼조";
+  const rsiSig = rsi >= 70 ? "과매수" : rsi <= 30 ? "과매도" : "중립";
+  return {
+    trend, trendKr,
+    ma10: ma10 ? Math.round(ma10 * 100) / 100 : null,
+    ma20: ma20 ? Math.round(ma20 * 100) / 100 : null,
+    rsi: Math.round(rsi * 10) / 10, rsiSig,
+    macdBull: macdW.hist > 0,
+    note: `주봉 ${trendKr} · RSI ${Math.round(rsi)} (${rsiSig}) · MACD ${macdW.hist > 0 ? "상향" : "하향"}`,
+    raw: { values: data },
+  };
+}
+
 async function analyzeOne(sym, tdKey, anthropicKey, fng, market, sectors) {
-  const url = `https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=120&apikey=${tdKey}`;
-  const res = await fetch(url);
-  const td = await res.json();
+  const [td, wkData, earnings] = await Promise.all([
+    fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=260&apikey=${tdKey}`).then(r => r.json()),
+    fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1week&outputsize=52&apikey=${tdKey}`).then(r => r.json()).catch(() => null),
+    fetchEarningsDays(sym, tdKey),
+  ]);
   if (td.status === "error" || !td.values) throw new Error(td.message || "데이터 조회 실패");
   if (td.values.length < 30) throw new Error("데이터 부족");
 
   const ind = computeIndicators(td.values);
-  const earnings = await fetchEarningsDays(sym, tdKey);
+  const weekly = wkData?.values ? computeWeeklyIndicators(wkData.values) : null;
   const r = ind.raw;
 
   // 시장 추세 (SPY/QQQ) — closes 배열로 추세 판정
@@ -260,6 +414,26 @@ async function analyzeOne(sym, tdKey, anthropicKey, fng, market, sectors) {
     const spy = trendOf("SPY"), qqq = trendOf("QQQ");
     if (spy || qqq) {
       marketLine = `\nMarket Trend: ${spy ? `SPY ${spy.trend} (today ${spy.pct >= 0 ? "+" : ""}${spy.pct?.toFixed(2)}%)` : ""}${spy && qqq ? ", " : ""}${qqq ? `QQQ ${qqq.trend} (today ${qqq.pct >= 0 ? "+" : ""}${qqq.pct?.toFixed(2)}%)` : ""} — overall market direction; trading with the trend improves odds`;
+    }
+  }
+
+  // 상대 강도 (RS) vs SPY
+  let rsLine = "";
+  const spyData = market?.SPY;
+  const stockCloses = td.values.slice().reverse().map(d => parseFloat(d.close));
+  if (spyData?.closes?.length >= 22) {
+    const sc = spyData.closes;
+    const calcRS = (period) => {
+      if (sc.length < period + 1 || stockCloses.length < period + 1) return null;
+      const stockRet = ((stockCloses[stockCloses.length - 1] - stockCloses[stockCloses.length - 1 - period]) / stockCloses[stockCloses.length - 1 - period]) * 100;
+      const spyRet = ((sc[sc.length - 1] - sc[sc.length - 1 - period]) / sc[sc.length - 1 - period]) * 100;
+      return { stock: stockRet, spy: spyRet, rs: stockRet - spyRet };
+    };
+    const rs1m = calcRS(21);
+    const rs3m = calcRS(63);
+    if (rs1m) {
+      const rsStr = (rs) => `stock ${rs.stock >= 0 ? "+" : ""}${rs.stock.toFixed(1)}% vs SPY ${rs.spy >= 0 ? "+" : ""}${rs.spy.toFixed(1)}% → RS ${rs.rs >= 0 ? "+" : ""}${rs.rs.toFixed(1)}%`;
+      rsLine = `\nRelative Strength vs SPY: 1M ${rsStr(rs1m)}${rs3m ? `; 3M ${rsStr(rs3m)}` : ""}. Positive RS = outperforming market (leading stock); negative RS = underperforming (lagging stock). Strong RS combined with bullish setup = high-conviction; weak RS = red flag even on bullish chart.`;
     }
   }
 
@@ -280,10 +454,17 @@ Price vs VWAP(20): ${ind.indicators.vwap.note} (${ind.indicators.vwap.status})
 Bollinger Bands(20,2): upper ${r.bb.upper.toFixed(2)}, middle ${r.bb.middle.toFixed(2)}, lower ${r.bb.lower.toFixed(2)} -> price at ${ind.indicators.bollinger.position}
 Volume: ${Math.round(r.volRatio * 100)}% of 20-day average (${ind.indicators.volume.signal})
 Volume/Price pressure (last 10d, wick-aware Chaikin A/D, range -100 to +100): ${ind.indicators.volprice.signal} — ${ind.indicators.volprice.note}. Positive = closes near highs with lower wicks (buying); negative = upper wicks / closes near lows (selling).
-Support/Resistance (60d): resistance ${r.levels.resistance.toFixed(2)} (+${r.levels.resistDist.toFixed(1)}% away), support ${r.levels.support.toFixed(2)} (-${r.levels.supportDist.toFixed(1)}% away)
+Support/Resistance (swing pivots): Resistance: ${r.swingLevels.resistances.map((l, i) => `R${i + 1}=$${l.price.toFixed(2)} (+${l.dist.toFixed(1)}%${l.strength > 1 ? `, tested ${l.strength}x` : ""})`).join(", ")} | Support: ${r.swingLevels.supports.map((l, i) => `S${i + 1}=$${l.price.toFixed(2)} (-${l.dist.toFixed(1)}%${l.strength > 1 ? `, tested ${l.strength}x` : ""})`).join(", ")}
 ATR(14): ${r.atr.toFixed(2)} (${r.atrPct.toFixed(1)}% of price). Volatility-based stop suggestion (2x ATR below price): ${r.atrStop.toFixed(2)}
-MA20: ${r.ma20.toFixed(2)} (price ${ind.indicators.trend.short}), MA50: ${r.ma50.toFixed(2)} (price ${ind.indicators.trend.medium})${marketLine}${sectorLine}${earnings ? `\nNext Earnings: ${earnings.date} (in ${earnings.days} days)${earnings.days <= 14 ? " — WARNING: earnings imminent, high gap risk for a swing position" : ""}` : ""}
+MA20: ${r.ma20.toFixed(2)} (price ${ind.indicators.trend.short}), MA50: ${r.ma50.toFixed(2)} (price ${ind.indicators.trend.medium})${marketLine}${rsLine}${sectorLine}${earnings ? `\nNext Earnings: ${earnings.date} (in ${earnings.days} days)${earnings.days <= 14 ? " — WARNING: earnings imminent, high gap risk for a swing position" : ""}` : ""}
 ${fng != null ? `\nMarket Fear & Greed Index: ${fng}/100 (${fng <= 25 ? "Extreme Fear" : fng <= 45 ? "Fear" : fng <= 55 ? "Neutral" : fng <= 75 ? "Greed" : "Extreme Greed"}) — overall market sentiment, use as context for risk` : ""}
+52-Week Position: ${ind.indicators.pos52w.note}
+RSI Divergence (last 60 days): ${ind.indicators.rsiDiv.type === "none" ? "none detected" : `${ind.indicators.rsiDiv.type.toUpperCase()} — ${ind.indicators.rsiDiv.note}`}
+Volume Quality (last 20 days): ${ind.indicators.volPattern.note}
+${weekly ? `Weekly Timeframe (higher timeframe alignment):
+  Weekly MA10=$${weekly.ma10} (price ${ind.current_price > weekly.ma10 ? "above" : "below"}), Weekly MA20=$${weekly.ma20} (price ${weekly.ma20 ? (ind.current_price > weekly.ma20 ? "above" : "below") : "n/a"})
+  Weekly RSI(14): ${weekly.rsi} (${weekly.rsiSig}), Weekly MACD: ${weekly.macdBull ? "bullish" : "bearish"}
+  Weekly trend: ${weekly.trend} — daily BUY aligned with weekly uptrend = high conviction; counter-trend = lower confidence required` : ""}
 
 Interpret this for swing trading.`;
 
@@ -310,7 +491,174 @@ Interpret this for swing trading.`;
     const sc = typeof sectors[secEtf] === "object" ? sectors[secEtf].score : sectors[secEtf];
     if (sc != null) sectorInfo = { score: sc, name: SECTOR_KR[secEtf] || secEtf };
   }
-  return { ticker: sym, ...ind, ...interp, earnings, sector: sectorInfo };
+  return { ticker: sym, ...ind, ...interp, earnings, sector: sectorInfo, ohlcv: td.values, weekly, weeklyOhlcv: wkData?.values ?? null };
+}
+
+// ── GitHub Gist 동기화 ────────────────────────────────
+const GIST_FILE = "wz_stock.json";
+const GIST_DESC = "wz-stock app data";
+
+async function ghReq(method, path, token, body) {
+  const r = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!r.ok) throw new Error(`GitHub ${r.status}`);
+  return r.json();
+}
+
+async function findOrCreateGist(token) {
+  const cached = localStorage.getItem("wz_gistId");
+  if (cached) {
+    try { await ghReq("GET", `/gists/${cached}`, token); return cached; } catch {}
+  }
+  const list = await ghReq("GET", "/gists?per_page=100", token);
+  const found = list.find(g => g.description === GIST_DESC && g.files?.[GIST_FILE]);
+  if (found) { localStorage.setItem("wz_gistId", found.id); return found.id; }
+  const blank = { positions: [], settings: { accountSize: null, riskPct: 1 }, history: [] };
+  const created = await ghReq("POST", "/gists", token, {
+    description: GIST_DESC, public: false,
+    files: { [GIST_FILE]: { content: JSON.stringify(blank) } },
+  });
+  localStorage.setItem("wz_gistId", created.id);
+  return created.id;
+}
+
+async function loadGist(token, id) {
+  const data = await ghReq("GET", `/gists/${id}`, token);
+  const raw = data.files?.[GIST_FILE]?.content;
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function pushGist(token, id, payload) {
+  await ghReq("PATCH", `/gists/${id}`, token, {
+    files: { [GIST_FILE]: { content: JSON.stringify(payload) } },
+  });
+}
+// ─────────────────────────────────────────────────────
+
+function StockChart({ ohlcv, weeklyOhlcv, levels }) {
+  const containerRef = useRef(null);
+  const [tf, setTf] = useState("day");
+
+  const activeOhlcv = tf === "week" && weeklyOhlcv?.length ? weeklyOhlcv : ohlcv;
+
+  useEffect(() => {
+    if (!containerRef.current || !activeOhlcv?.length) return;
+
+    const data = [...activeOhlcv].reverse();
+    const closes = data.map(d => parseFloat(d.close));
+
+    const chart = createChart(containerRef.current, {
+      width: containerRef.current.clientWidth,
+      height: 260,
+      layout: { background: { type: "solid", color: "#090e19" }, textColor: "#607d9f" },
+      grid: { vertLines: { color: "#182434" }, horzLines: { color: "#182434" } },
+      crosshair: { mode: 1 },
+      rightPriceScale: { borderColor: "#182434" },
+      timeScale: { borderColor: "#182434", timeVisible: false },
+    });
+
+    // 캔들차트
+    const candles = chart.addSeries(CandlestickSeries, {
+      upColor: "#00e5a0", downColor: "#ff4757",
+      borderUpColor: "#00e5a0", borderDownColor: "#ff4757",
+      wickUpColor: "#00e5a0", wickDownColor: "#ff4757",
+    });
+    candles.setData(data.map(d => ({
+      time: d.datetime.slice(0, 10),
+      open: parseFloat(d.open), high: parseFloat(d.high),
+      low: parseFloat(d.low), close: parseFloat(d.close),
+    })));
+
+    // 거래량 (하단 20%)
+    const vol = chart.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceScaleId: "vol" });
+    chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    vol.setData(data.map(d => ({
+      time: d.datetime.slice(0, 10),
+      value: parseFloat(d.volume),
+      color: parseFloat(d.close) >= parseFloat(d.open) ? "#00e5a028" : "#ff475728",
+    })));
+
+    const maLine = (period, color) => {
+      const s = chart.addSeries(LineSeries, { color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+      s.setData(closes.map((_, i) => {
+        if (i < period - 1) return null;
+        return { time: data[i].datetime.slice(0, 10), value: closes.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0) / period };
+      }).filter(Boolean));
+    };
+
+    if (tf === "week") {
+      // 주봉: MA10w (파랑), MA20w (주황)
+      maLine(10, "#4a9eff");
+      maLine(20, "#ff8c42");
+    } else {
+      // 일봉: MA20, MA50, 볼린저 밴드
+      maLine(20, "#4a9eff");
+      maLine(50, "#ff8c42");
+      const bbLine = (upper) => closes.map((_, i) => {
+        if (i < 19) return null;
+        const sl = closes.slice(i - 19, i + 1);
+        const mean = sl.reduce((a, b) => a + b, 0) / 20;
+        const std = Math.sqrt(sl.map(c => (c - mean) ** 2).reduce((a, b) => a + b, 0) / 20);
+        return { time: data[i].datetime.slice(0, 10), value: upper ? mean + 2 * std : mean - 2 * std };
+      }).filter(Boolean);
+      const bbOpts = { color: "#607d9f66", lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false };
+      chart.addSeries(LineSeries, bbOpts).setData(bbLine(true));
+      chart.addSeries(LineSeries, bbOpts).setData(bbLine(false));
+    }
+
+    // 지지/저항 수평선 (일봉에서만)
+    if (tf === "day" && levels) {
+      levels.resistances.slice(0, 3).forEach((l, i) => {
+        candles.createPriceLine({
+          price: l.price, color: i === 0 ? "#ff4757cc" : "#ff475766",
+          lineWidth: 1, lineStyle: 1, axisLabelVisible: true,
+          title: `R${i + 1}${l.strength > 1 ? ` ×${l.strength}` : ""}`,
+        });
+      });
+      levels.supports.slice(0, 3).forEach((l, i) => {
+        candles.createPriceLine({
+          price: l.price, color: i === 0 ? "#00e5a0cc" : "#00e5a066",
+          lineWidth: 1, lineStyle: 1, axisLabelVisible: true,
+          title: `S${i + 1}${l.strength > 1 ? ` ×${l.strength}` : ""}`,
+        });
+      });
+    }
+
+    chart.timeScale().fitContent();
+
+    const ro = new ResizeObserver(() => {
+      if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth });
+    });
+    ro.observe(containerRef.current);
+
+    return () => { ro.disconnect(); chart.remove(); };
+  }, [activeOhlcv, tf, levels]);
+
+  return (
+    <div style={{ marginBottom: "12px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "5px" }}>
+        <div style={{ fontSize: "8px", color: "#334d66", letterSpacing: "1px", display: "flex", gap: "10px", flexWrap: "wrap" }}>
+          <span style={{ color: "#4a9eff" }}>— {tf === "week" ? "MA10w" : "MA20"}</span>
+          <span style={{ color: "#ff8c42" }}>— {tf === "week" ? "MA20w" : "MA50"}</span>
+          {tf === "day" && <><span style={{ color: "#607d9f" }}>-- BB</span><span style={{ color: "#ff4757" }}>— 저항</span><span style={{ color: "#00e5a0" }}>— 지지</span></>}
+        </div>
+        {weeklyOhlcv?.length > 0 && (
+          <div style={{ display: "flex", gap: "4px" }}>
+            {["day", "week"].map(t => (
+              <button key={t} onClick={() => setTf(t)}
+                style={{ fontSize: "8px", padding: "2px 7px", borderRadius: "2px", border: `1px solid ${tf === t ? "#00e5a0" : "#182434"}`, background: "transparent", color: tf === t ? "#00e5a0" : "#334d66", cursor: "pointer", fontFamily: "inherit" }}>
+                {t === "day" ? "일봉" : "주봉"}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div ref={containerRef} style={{ width: "100%", borderRadius: "3px", overflow: "hidden" }} />
+    </div>
+  );
 }
 
 export default function App() {
@@ -333,9 +681,68 @@ export default function App() {
   const [showPos, setShowPos] = useState(false);
   const [newPos, setNewPos] = useState({ ticker: "", entry: "", stop: "" });
 
+  const [gistToken, setGistToken] = useState(() => localStorage.getItem("wz_gistToken") || "");
+  const [gistStatus, setGistStatus] = useState("idle"); // idle | connecting | ok | err
+  const [accountSize, setAccountSize] = useState(null);
+  const [riskPct, setRiskPct] = useState(1);
+  const [history, setHistory] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const gistRef = useRef({ token: "", id: "" });
+  const stateRef = useRef({ positions: [], accountSize: null, riskPct: 1, history: [] });
+
+  useEffect(() => {
+    stateRef.current = { positions, accountSize, riskPct, history };
+  }, [positions, accountSize, riskPct, history]);
+
+  const syncToGist = async (patch) => {
+    const { token, id } = gistRef.current;
+    if (!token || !id) return;
+    const s = stateRef.current;
+    const payload = {
+      positions: patch?.positions ?? s.positions,
+      settings: { accountSize: patch?.accountSize ?? s.accountSize, riskPct: patch?.riskPct ?? s.riskPct },
+      history: patch?.history ?? s.history,
+    };
+    try { await pushGist(token, id, payload); } catch (e) { console.warn("Gist sync:", e.message); }
+  };
+
+  const connectGist = async (tok) => {
+    const t = (tok ?? gistToken).trim();
+    if (!t) return;
+    setGistStatus("connecting");
+    try {
+      const id = await findOrCreateGist(t);
+      gistRef.current = { token: t, id };
+      const data = await loadGist(t, id);
+      if (data) {
+        const localPos = stateRef.current.positions;
+        if (data.positions?.length) {
+          setPositions(data.positions);
+        } else if (localPos.length) {
+          // 로컬 데이터를 Gist로 마이그레이션
+          await pushGist(t, id, { positions: localPos, settings: { accountSize: null, riskPct: 1 }, history: [] });
+        }
+        if (data.settings?.accountSize != null) setAccountSize(data.settings.accountSize);
+        if (data.settings?.riskPct != null) setRiskPct(data.settings.riskPct);
+        if (data.history?.length) setHistory(data.history);
+      }
+      localStorage.setItem("wz_gistToken", t);
+      setGistToken(t);
+      setGistStatus("ok");
+    } catch {
+      setGistStatus("err");
+    }
+  };
+
+  useEffect(() => {
+    const tok = localStorage.getItem("wz_gistToken");
+    if (tok) connectGist(tok);
+  }, []);
+
   const savePositions = (next) => {
     setPositions(next);
     try { localStorage.setItem("wz_positions", JSON.stringify(next)); } catch {}
+    syncToGist({ positions: next });
   };
 
   const addPosition = () => {
@@ -359,6 +766,7 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem("wz_tdKey", tdKey); } catch {} }, [tdKey]);
   useEffect(() => { try { localStorage.setItem("wz_anthropicKey", anthropicKey); } catch {} }, [anthropicKey]);
   useEffect(() => { try { localStorage.setItem("wz_watchlist", input); } catch {} }, [input]);
+  useEffect(() => { syncToGist({ accountSize, riskPct }); }, [accountSize, riskPct]);
 
   useEffect(() => {
     fetch("https://feargreedchart.com/api/?action=all")
@@ -411,6 +819,31 @@ export default function App() {
       setResults(sorted);
       if (i < syms.length - 1) await new Promise(r => setTimeout(r, 8500));
     }
+
+    // 과거 기록 저장 (에러 제외, 최근 200개 유지)
+    const today = new Date().toISOString().slice(0, 10);
+    const newEntries = collected
+      .filter(r => !r.error && r.recommendation)
+      .map(r => ({
+        id: `${r.ticker}_${today}`,
+        date: today,
+        ticker: r.ticker,
+        company: r.company_name,
+        price: r.current_price,
+        recommendation: r.recommendation,
+        confidence: r.confidence,
+        summary: r.summary,
+        entry_zone: r.entry_zone,
+        target_price: r.target_price,
+        stop_loss: r.stop_loss,
+      }));
+    const merged = [
+      ...newEntries,
+      ...stateRef.current.history.filter(h => !newEntries.some(e => e.id === h.id)),
+    ].slice(0, 200);
+    setHistory(merged);
+    syncToGist({ history: merged });
+
     setAnalyzing(false);
   };
 
@@ -501,8 +934,41 @@ export default function App() {
           onChange={e => setTdKey(e.target.value)}
           onFocus={() => setFocused("t")} onBlur={() => setFocused("")}
           placeholder="Twelve Data API 키" />
+
+        {/* GitHub Gist 동기화 */}
+        <div style={{ display: "flex", gap: "6px", marginBottom: "9px" }}>
+          <input style={{ ...s.inp("g"), marginBottom: 0, flex: 1 }} type="password" value={gistToken}
+            onChange={e => setGistToken(e.target.value)}
+            onFocus={() => setFocused("g")} onBlur={() => setFocused("")}
+            placeholder="GitHub Token (ghp_...) — 기기간 데이터 동기화" />
+          <button onClick={() => connectGist()} disabled={gistStatus === "connecting" || !gistToken.trim()}
+            style={{ ...s.btn2, padding: "0 14px", whiteSpace: "nowrap", color: gistStatus === "ok" ? "#00e5a0" : gistStatus === "err" ? "#ff4757" : "#607d9f", borderColor: gistStatus === "ok" ? "#00e5a044" : gistStatus === "err" ? "#ff475744" : "#182434" }}>
+            {gistStatus === "connecting" ? "..." : gistStatus === "ok" ? "✓ 연결됨" : gistStatus === "err" ? "✕ 오류" : "연결"}
+          </button>
+        </div>
+
+        {/* 계좌 설정 (Gist 연결 시) */}
+        {gistStatus === "ok" && (
+          <div style={{ display: "flex", gap: "6px", marginBottom: "9px", alignItems: "center" }}>
+            <input
+              style={{ ...s.inp("ac"), marginBottom: 0, flex: 1 }}
+              type="number" inputMode="numeric" value={accountSize ?? ""}
+              onChange={e => setAccountSize(e.target.value ? parseFloat(e.target.value) : null)}
+              onFocus={() => setFocused("ac")} onBlur={() => setFocused("")}
+              placeholder="계좌 총액 ($)" />
+            <div style={{ display: "flex", gap: "4px" }}>
+              {[1, 2, 3].map(p => (
+                <button key={p} onClick={() => setRiskPct(p)}
+                  style={{ ...s.btn2, padding: "10px 10px", color: riskPct === p ? "#00e5a0" : "#607d9f", borderColor: riskPct === p ? "#00e5a044" : "#182434", fontSize: "10px" }}>
+                  {p}%
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div style={s.hint}>
-          키·관심종목은 이 기기 브라우저에 저장돼요 (다음에 자동 입력)
+          API 키는 이 기기에만 저장 · Gist 연결 시 포지션·기록은 GitHub에 동기화
           {(tdKey || anthropicKey) && (
             <span onClick={() => { setTdKey(""); setAnthropicKey(""); try { localStorage.removeItem("wz_tdKey"); localStorage.removeItem("wz_anthropicKey"); } catch {} }}
               style={{ color: "#ff4757", cursor: "pointer", marginLeft: "8px" }}>[키 삭제]</span>
@@ -605,6 +1071,7 @@ export default function App() {
 
               {open && (
                 <div style={{ ...s.card, borderColor: rc + "33", borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
+                  {r.ohlcv && <StockChart ohlcv={r.ohlcv} weeklyOhlcv={r.weeklyOhlcv} levels={r.indicators?.levels?.swingLevels} />}
                   {r.position && (
                     <div style={{ marginBottom: "10px", padding: "10px 12px", borderRadius: "3px", background: r.position.status.col + "12", border: `1px solid ${r.position.status.col}44` }}>
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
@@ -644,7 +1111,8 @@ export default function App() {
                       { lbl: "VWAP", val: r.indicators?.vwap?.status, col: sigCol(r.indicators?.vwap?.status), note: r.indicators?.vwap?.note },
                       { lbl: "볼린저", val: r.indicators?.bollinger?.position, col: "#ffb830", note: r.indicators?.bollinger?.note },
                       { lbl: "거래량", val: r.indicators?.volume?.ratio + "x", col: sigCol(r.indicators?.volume?.signal), note: r.indicators?.volume?.note },
-                      { lbl: "추세 S/M", val: `${r.indicators?.trend?.short}/${r.indicators?.trend?.medium}`, col: sigCol(r.indicators?.trend?.short), note: r.indicators?.trend?.note },
+                      { lbl: "추세 일봉", val: `${r.indicators?.trend?.short}/${r.indicators?.trend?.medium}`, col: sigCol(r.indicators?.trend?.short), note: r.indicators?.trend?.note },
+                      ...(r.weekly ? [{ lbl: "추세 주봉", val: r.weekly.trendKr, col: r.weekly.trend === "uptrend" ? "#00e5a0" : r.weekly.trend === "downtrend" ? "#ff4757" : "#ffb830", note: r.weekly.note }] : []),
                     ].map((ind, i) => (
                       <div key={i} style={s.iCard}>
                         <div style={s.lbl}>{ind.lbl}</div>
@@ -656,8 +1124,23 @@ export default function App() {
 
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginTop: "8px" }}>
                     <div style={s.iCard}>
-                      <div style={s.lbl}>지지 / 저항</div>
-                      <div style={{ fontSize: "9px", color: "#b0c4d8", lineHeight: 1.5 }}>{r.indicators?.levels?.note}</div>
+                      <div style={s.lbl}>지지 / 저항 (스윙 피벗)</div>
+                      {r.indicators?.levels?.swingLevels ? (
+                        <div style={{ fontSize: "9px", lineHeight: 1.6 }}>
+                          {r.indicators.levels.swingLevels.resistances.slice(0, 2).map((l, i) => (
+                            <div key={i} style={{ color: i === 0 ? "#ff4757" : "#ff475788" }}>
+                              R{i + 1} ${l.price.toFixed(1)} <span style={{ color: "#334d66" }}>+{l.dist.toFixed(1)}%{l.strength > 1 ? ` ×${l.strength}` : ""}</span>
+                            </div>
+                          ))}
+                          {r.indicators.levels.swingLevels.supports.slice(0, 2).map((l, i) => (
+                            <div key={i} style={{ color: i === 0 ? "#00e5a0" : "#00e5a088" }}>
+                              S{i + 1} ${l.price.toFixed(1)} <span style={{ color: "#334d66" }}>-{l.dist.toFixed(1)}%{l.strength > 1 ? ` ×${l.strength}` : ""}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div style={{ fontSize: "9px", color: "#b0c4d8", lineHeight: 1.5 }}>{r.indicators?.levels?.note}</div>
+                      )}
                     </div>
                     <div style={s.iCard}>
                       <div style={s.lbl}>매수·매도 압력</div>
@@ -681,6 +1164,35 @@ export default function App() {
                         <div style={{ fontSize: "8px", color: "#334d66", lineHeight: 1.4 }}>{r.sector.name} 섹터</div>
                       </div>
                     ) : <div style={s.iCard}><div style={s.lbl}>섹터 강도</div><div style={{ fontSize: "9px", color: "#334d66", marginTop: "4px" }}>해당 없음</div></div>}
+                  </div>
+
+                  {/* 심화 분석 블록 */}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", marginTop: "8px" }}>
+                    {/* 52주 위치 */}
+                    <div style={s.iCard}>
+                      <div style={s.lbl}>52주 위치</div>
+                      <div style={{ fontSize: "13px", fontWeight: "700", marginBottom: "2px", color: r.indicators?.pos52w?.pos >= 75 ? "#00e5a0" : r.indicators?.pos52w?.pos <= 25 ? "#ff4757" : "#ffb830" }}>
+                        {r.indicators?.pos52w?.pos}%
+                      </div>
+                      <div style={{ fontSize: "8px", color: "#334d66", lineHeight: 1.4 }}>{r.indicators?.pos52w?.zone}</div>
+                      <div style={{ fontSize: "8px", color: "#334d66", lineHeight: 1.4 }}>고점 대비 {r.indicators?.pos52w?.fromH}%</div>
+                    </div>
+                    {/* RSI 다이버전스 */}
+                    <div style={s.iCard}>
+                      <div style={s.lbl}>RSI 다이버전스</div>
+                      <div style={{ fontSize: "11px", fontWeight: "700", marginBottom: "2px", color: r.indicators?.rsiDiv?.type === "bullish" ? "#00e5a0" : r.indicators?.rsiDiv?.type === "bearish" ? "#ff4757" : "#334d66" }}>
+                        {r.indicators?.rsiDiv?.type === "bullish" ? "강세" : r.indicators?.rsiDiv?.type === "bearish" ? "약세" : "없음"}
+                      </div>
+                      <div style={{ fontSize: "8px", color: "#334d66", lineHeight: 1.4 }}>{r.indicators?.rsiDiv?.note}</div>
+                    </div>
+                  </div>
+                  {/* 거래량 품질 */}
+                  <div style={{ ...s.iCard, marginTop: "8px" }}>
+                    <div style={s.lbl}>거래량 품질 (상승일 vs 하락일)</div>
+                    <div style={{ fontSize: "11px", fontWeight: "700", marginBottom: "3px", color: r.indicators?.volPattern?.ratio >= 1.3 ? "#00e5a0" : r.indicators?.volPattern?.ratio <= 0.77 ? "#ff4757" : "#ffb830" }}>
+                      {r.indicators?.volPattern?.quality}
+                    </div>
+                    <div style={{ fontSize: "8px", color: "#334d66", lineHeight: 1.4 }}>{r.indicators?.volPattern?.note}</div>
                   </div>
 
                   {r.earnings && (
@@ -718,6 +1230,49 @@ export default function App() {
                     ))}
                   </div>
 
+                  {/* 포지션 사이징 */}
+                  {accountSize && r.stop_loss && r.current_price && (() => {
+                    const riskAmt = accountSize * (riskPct / 100);
+                    const riskPerShare = r.current_price - r.stop_loss;
+                    if (riskPerShare <= 0) return null;
+                    const shares = Math.floor(riskAmt / riskPerShare);
+                    const invest = shares * r.current_price;
+                    const investPct = (invest / accountSize) * 100;
+                    const reward = r.target_price ? (r.target_price - r.current_price) * shares : null;
+                    const rr = r.target_price ? ((r.target_price - r.current_price) / riskPerShare) : null;
+                    return (
+                      <div style={{ marginTop: "12px", padding: "12px", borderRadius: "3px", background: "#070d18", border: "1px solid #182434" }}>
+                        <div style={{ ...s.lbl, marginBottom: "8px", color: "#ffb830" }}>포지션 사이징</div>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "10px" }}>
+                          <div>
+                            <div style={{ color: "#334d66", fontSize: "8px", marginBottom: "2px" }}>리스크 한도</div>
+                            <div style={{ color: "#dce8f5", fontWeight: "700" }}>${riskAmt.toFixed(0)} <span style={{ color: "#334d66", fontWeight: "400" }}>({riskPct}%)</span></div>
+                          </div>
+                          <div>
+                            <div style={{ color: "#334d66", fontSize: "8px", marginBottom: "2px" }}>주당 리스크</div>
+                            <div style={{ color: "#ff4757", fontWeight: "700" }}>${riskPerShare.toFixed(2)}</div>
+                          </div>
+                          <div>
+                            <div style={{ color: "#334d66", fontSize: "8px", marginBottom: "2px" }}>매수 주수</div>
+                            <div style={{ color: "#00e5a0", fontWeight: "700", fontSize: "14px" }}>{shares}주</div>
+                          </div>
+                          <div>
+                            <div style={{ color: "#334d66", fontSize: "8px", marginBottom: "2px" }}>투자 금액</div>
+                            <div style={{ color: "#dce8f5", fontWeight: "700" }}>${invest.toFixed(0)} <span style={{ color: "#334d66", fontWeight: "400" }}>({investPct.toFixed(1)}%)</span></div>
+                          </div>
+                        </div>
+                        {rr != null && (
+                          <div style={{ marginTop: "8px", paddingTop: "8px", borderTop: "1px solid #182434", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <span style={{ fontSize: "9px", color: "#334d66" }}>리스크/수익비 (R:R)</span>
+                            <span style={{ fontWeight: "700", fontSize: "13px", color: rr >= 2 ? "#00e5a0" : rr >= 1.5 ? "#ffb830" : "#ff4757" }}>
+                              {rr.toFixed(1)}x {reward != null ? `(+$${reward.toFixed(0)})` : ""}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
                   {!r.position && (
                     <button
                       style={{ ...s.btn2, width: "100%", marginTop: "12px", boxSizing: "border-box" }}
@@ -735,6 +1290,31 @@ export default function App() {
             </div>
           );
         })}
+
+        {history.length > 0 && (
+          <div style={{ marginTop: "20px" }}>
+            <div style={{ ...s.row, cursor: "pointer", marginBottom: showHistory ? 0 : "8px" }}
+              onClick={() => setShowHistory(v => !v)}>
+              <div style={{ flex: 1, fontSize: "11px", fontWeight: "700", letterSpacing: "1px" }}>과거 분석 기록</div>
+              <div style={{ fontSize: "9px", color: "#334d66" }}>{history.length}건</div>
+              <div style={{ color: "#334d66", fontSize: "12px", transform: showHistory ? "rotate(90deg)" : "none", transition: "transform 0.2s" }}>▸</div>
+            </div>
+            {showHistory && (
+              <div style={{ ...s.card, borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
+                {history.slice(0, 50).map((h, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 0", borderBottom: "1px solid #121c2a", fontSize: "10px" }}>
+                    <span style={{ color: "#334d66", minWidth: "72px", fontSize: "8px" }}>{h.date}</span>
+                    <span style={{ fontWeight: "700", minWidth: "48px" }}>{h.ticker}</span>
+                    <span style={{ fontSize: "9px", color: "#607d9f", flex: 1 }}>{h.company}</span>
+                    <span style={{ fontWeight: "700", color: h.recommendation === "BUY" ? "#00e5a0" : h.recommendation === "SELL" ? "#ff4757" : "#ffb830", minWidth: "32px", textAlign: "right" }}>{h.recommendation}</span>
+                    <span style={{ color: "#334d66", fontSize: "8px", minWidth: "24px", textAlign: "right" }}>{h.confidence}/10</span>
+                  </div>
+                ))}
+                {history.length > 50 && <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px", textAlign: "center" }}>최근 50건 표시 중 (전체 {history.length}건)</div>}
+              </div>
+            )}
+          </div>
+        )}
 
         {results.length > 0 && (
           <div style={{ textAlign: "center", marginTop: "18px", fontSize: "9px", color: "#1e2e3e", letterSpacing: "1.5px" }}>
