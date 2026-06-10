@@ -314,9 +314,9 @@ Interpret this for swing trading.`;
 }
 
 export default function App() {
-  const [tdKey, setTdKey] = useState("");
-  const [anthropicKey, setAnthropicKey] = useState("");
-  const [input, setInput] = useState("");
+  const [tdKey, setTdKey] = useState(() => { try { return localStorage.getItem("wz_tdKey") || ""; } catch { return ""; } });
+  const [anthropicKey, setAnthropicKey] = useState(() => { try { return localStorage.getItem("wz_anthropicKey") || ""; } catch { return ""; } });
+  const [input, setInput] = useState(() => { try { return localStorage.getItem("wz_watchlist") || ""; } catch { return ""; } });
   const [focused, setFocused] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
   const [progress, setProgress] = useState({ cur: 0, total: 0, sym: "" });
@@ -355,6 +355,10 @@ export default function App() {
       p.ticker === ticker ? { ...p, stop: newStop, target: newTarget } : p
     ));
   };
+
+  useEffect(() => { try { localStorage.setItem("wz_tdKey", tdKey); } catch {} }, [tdKey]);
+  useEffect(() => { try { localStorage.setItem("wz_anthropicKey", anthropicKey); } catch {} }, [anthropicKey]);
+  useEffect(() => { try { localStorage.setItem("wz_watchlist", input); } catch {} }, [input]);
 
   useEffect(() => {
     fetch("https://feargreedchart.com/api/?action=all")
@@ -497,7 +501,13 @@ export default function App() {
           onChange={e => setTdKey(e.target.value)}
           onFocus={() => setFocused("t")} onBlur={() => setFocused("")}
           placeholder="Twelve Data API 키" />
-        <div style={s.hint}>키는 이 기기에만 입력되며 새로고침하면 다시 입력해야 해요</div>
+        <div style={s.hint}>
+          키·관심종목은 이 기기 브라우저에 저장돼요 (다음에 자동 입력)
+          {(tdKey || anthropicKey) && (
+            <span onClick={() => { setTdKey(""); setAnthropicKey(""); try { localStorage.removeItem("wz_tdKey"); localStorage.removeItem("wz_anthropicKey"); } catch {} }}
+              style={{ color: "#ff4757", cursor: "pointer", marginLeft: "8px" }}>[키 삭제]</span>
+          )}
+        </div>
 
         <input style={s.inp("tk")} value={input}
           onChange={e => setInput(e.target.value)}
