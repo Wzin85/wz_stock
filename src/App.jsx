@@ -488,6 +488,8 @@ export default function App() {
             </div>
           );
         })()}
+
+        <input style={s.inp("a")} type="password" value={anthropicKey}
           onChange={e => setAnthropicKey(e.target.value)}
           onFocus={() => setFocused("a")} onBlur={() => setFocused("")}
           placeholder="Anthropic API 키 (sk-ant-...)" />
@@ -733,4 +735,3 @@ export default function App() {
     </div>
   );
 }
-
