@@ -9,6 +9,8 @@ How to think (internally, before writing):
 3. THINK IN SCENARIOS — Frame the setup as "bullish if X holds, invalidated if Y breaks." Anchor STOP_LOSS to the invalidation level (below support / beyond 2x ATR) and TARGET to the next real resistance.
 4. POSITION LOGIC — Confidence reflects edge quality, not just bullishness. A clean trend with room to resistance and a strong market = high conviction. Mixed signals or hostile backdrop = low conviction even if direction leans up.
 
+If the message says the user ALREADY HOLDS the position, switch from "entry analysis" to "position management": judge holding vs trimming vs exiting, only trail the stop UPWARD, and write the SUMMARY as a holding decision — never as a fresh buy pitch.
+
 Respond ONLY in this exact key=value format, one per line, no JSON, no markdown, no extra text:
 
 COMPANY=애플
@@ -388,7 +390,7 @@ function computeWeeklyIndicators(values) {
   };
 }
 
-async function analyzeOne(sym, tdKey, anthropicKey, fng, market, sectors) {
+async function analyzeOne(sym, tdKey, anthropicKey, fng, market, sectors, heldPos) {
   const [td, wkData, earnings] = await Promise.all([
     fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=260&apikey=${tdKey}`).then(r => r.json()),
     fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1week&outputsize=52&apikey=${tdKey}`).then(r => r.json()).catch(() => null),
@@ -468,6 +470,25 @@ ${weekly ? `Weekly Timeframe (higher timeframe alignment):
 
 Interpret this for swing trading.`;
 
+  // 보유 종목이면 "신규 진입"이 아니라 "보유 관리" 관점으로 전환
+  let holdingMsg = "";
+  if (heldPos) {
+    const pnl = ((ind.current_price - heldPos.entry) / heldPos.entry) * 100;
+    holdingMsg = `
+
+IMPORTANT — ALREADY HOLDING THIS POSITION:
+The user already owns this stock. Entry price: $${heldPos.entry}${heldPos.stop != null ? `, current stop: $${heldPos.stop}` : ""}${heldPos.target != null ? `, current target: $${heldPos.target}` : ""}. Current unrealized P&L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}%.
+Evaluate this NOT as a fresh entry but as POSITION MANAGEMENT. Your RECOMMENDATION means:
+- BUY = thesis intact, keep holding (and optionally room to add)
+- HOLD = hold but watch closely / no action
+- SELL = exit or trim, thesis weakening
+Rules for a held position:
+- STOP_LOSS may only be RAISED from the current stop (trailing), never lowered — protecting gains. If price has moved up, consider trailing the stop up toward breakeven or a higher support. If the analysis would suggest a lower stop than the user's current one, keep the user's current stop.
+- TARGET_PRICE: if the position is in profit and trend is strong, you may raise the target toward the next resistance; otherwise keep it realistic.
+- SUMMARY must address the HOLDING decision (계속 보유 / 손절 상향 / 일부 익절 / 청산) given the +${pnl.toFixed(1)}% P&L, not a fresh-entry pitch.
+- Frame ENTRY_ZONE as an "add zone" only if adding makes sense; otherwise set it to the current price.`;
+  }
+
   const cres = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -478,7 +499,7 @@ Interpret this for swing trading.`;
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6", max_tokens: 800, temperature: 0.4,
-      system: INTERPRET_PROMPT, messages: [{ role: "user", content: userMsg }],
+      system: INTERPRET_PROMPT, messages: [{ role: "user", content: userMsg + holdingMsg }],
     }),
   });
   const cdata = await cres.json();
@@ -679,7 +700,9 @@ export default function App() {
     catch { return []; }
   });
   const [showPos, setShowPos] = useState(false);
-  const [newPos, setNewPos] = useState({ ticker: "", entry: "", stop: "" });
+  const [newPos, setNewPos] = useState({ ticker: "", entry: "", target: "", stop: "" });
+  const [editingPos, setEditingPos] = useState(null); // ticker being edited
+  const [editVals, setEditVals] = useState({ entry: "", target: "", stop: "" });
 
   const [gistToken, setGistToken] = useState(() => localStorage.getItem("wz_gistToken") || "");
   const [gistStatus, setGistStatus] = useState("idle"); // idle | connecting | ok | err
@@ -747,12 +770,27 @@ export default function App() {
 
   const addPosition = () => {
     const t = newPos.ticker.trim().toUpperCase();
-    const entry = parseFloat(newPos.entry), stop = parseFloat(newPos.stop);
+    const entry = parseFloat(newPos.entry), stop = parseFloat(newPos.stop), target = parseFloat(newPos.target);
     if (!t || isNaN(entry)) { setError("티커와 진입가를 입력해주세요"); return; }
     if (positions.some(p => p.ticker === t)) { setError(`${t}는 이미 보유 목록에 있어요`); return; }
     setError(null);
-    savePositions([...positions, { ticker: t, side: "BUY", entry, stop: isNaN(stop) ? null : stop, target: null, date: new Date().toISOString().slice(0, 10) }]);
-    setNewPos({ ticker: "", entry: "", stop: "" });
+    savePositions([...positions, { ticker: t, side: "BUY", entry, stop: isNaN(stop) ? null : stop, target: isNaN(target) ? null : target, date: new Date().toISOString().slice(0, 10) }]);
+    setNewPos({ ticker: "", entry: "", target: "", stop: "" });
+  };
+
+  const startEdit = (p) => {
+    setEditingPos(p.ticker);
+    setEditVals({ entry: String(p.entry ?? ""), target: p.target != null ? String(p.target) : "", stop: p.stop != null ? String(p.stop) : "" });
+  };
+
+  const saveEdit = (ticker) => {
+    const entry = parseFloat(editVals.entry), target = parseFloat(editVals.target), stop = parseFloat(editVals.stop);
+    if (isNaN(entry)) { setError("진입가는 비울 수 없어요"); return; }
+    setError(null);
+    savePositions(positions.map(p => p.ticker === ticker
+      ? { ...p, entry, target: isNaN(target) ? null : target, stop: isNaN(stop) ? null : stop }
+      : p));
+    setEditingPos(null);
   };
 
   const removePosition = (t) => savePositions(positions.filter(p => p.ticker !== t));
@@ -795,7 +833,8 @@ export default function App() {
     for (let i = 0; i < syms.length; i++) {
       setProgress({ cur: i + 1, total: syms.length, sym: syms[i] });
       try {
-        const res = await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng, market, sectors);
+        const heldPos = positions.find(p => p.ticker === syms[i]) || null;
+        const res = await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng, market, sectors, heldPos);
         const pos = positions.find(p => p.ticker === syms[i]);
         if (pos) {
           const pnlPct = ((res.current_price - pos.entry) / pos.entry) * 100;
@@ -995,17 +1034,51 @@ export default function App() {
             <div style={{ ...s.lbl, marginBottom: "10px" }}>보유 종목</div>
             {positions.length === 0 && <div style={{ fontSize: "11px", color: "#334d66", marginBottom: "12px" }}>아직 등록된 보유 종목이 없어요</div>}
             {positions.map(p => (
-              <div key={p.ticker} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: "1px solid #121c2a", fontSize: "11px" }}>
-                <span style={{ fontWeight: "700", minWidth: "52px" }}>{p.ticker}</span>
-                <span style={{ flex: 1, color: "#607d9f" }}>진입 ${p.entry}{p.stop != null ? ` · 손절 $${p.stop}` : ""}</span>
-                <span onClick={() => removePosition(p.ticker)} style={{ color: "#ff4757", cursor: "pointer", padding: "2px 8px", fontWeight: "700" }}>×</span>
-              </div>
+              editingPos === p.ticker ? (
+                <div key={p.ticker} style={{ padding: "10px 0", borderBottom: "1px solid #121c2a" }}>
+                  <div style={{ fontWeight: "700", fontSize: "12px", marginBottom: "6px" }}>{p.ticker} 수정</div>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: "8px", color: "#334d66", marginBottom: "2px" }}>진입가</div>
+                      <input value={editVals.entry} onChange={e => setEditVals({ ...editVals, entry: e.target.value })}
+                        inputMode="decimal" style={{ ...s.inp("e1"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: "8px", color: "#00e5a0", marginBottom: "2px" }}>목표가</div>
+                      <input value={editVals.target} onChange={e => setEditVals({ ...editVals, target: e.target.value })}
+                        inputMode="decimal" style={{ ...s.inp("e2"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: "8px", color: "#ff4757", marginBottom: "2px" }}>손절가</div>
+                      <input value={editVals.stop} onChange={e => setEditVals({ ...editVals, stop: e.target.value })}
+                        inputMode="decimal" style={{ ...s.inp("e3"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: "6px", marginTop: "8px" }}>
+                    <button style={{ ...s.btn2, flex: 1, color: "#607d9f" }} onClick={() => setEditingPos(null)}>취소</button>
+                    <button style={{ ...s.btn2, flex: 1, color: "#00e5a0", borderColor: "#00e5a055" }} onClick={() => saveEdit(p.ticker)}>저장</button>
+                  </div>
+                </div>
+              ) : (
+                <div key={p.ticker} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: "1px solid #121c2a", fontSize: "11px" }}>
+                  <span style={{ fontWeight: "700", minWidth: "52px" }}>{p.ticker}</span>
+                  <span style={{ flex: 1, color: "#607d9f" }}>
+                    진입 ${p.entry}
+                    {p.target != null ? <span style={{ color: "#00e5a0" }}> · 목표 ${p.target}</span> : ""}
+                    {p.stop != null ? <span style={{ color: "#ff4757" }}> · 손절 ${p.stop}</span> : ""}
+                  </span>
+                  <span onClick={() => startEdit(p)} style={{ color: "#607d9f", cursor: "pointer", padding: "2px 6px", fontSize: "13px" }}>✎</span>
+                  <span onClick={() => removePosition(p.ticker)} style={{ color: "#ff4757", cursor: "pointer", padding: "2px 6px", fontWeight: "700" }}>×</span>
+                </div>
+              )
             ))}
             <div style={{ display: "flex", gap: "6px", marginTop: "12px" }}>
               <input value={newPos.ticker} onChange={e => setNewPos({ ...newPos, ticker: e.target.value })}
-                placeholder="티커" style={{ ...s.inp("np1"), marginBottom: 0, flex: "1.2", fontSize: "12px", padding: "9px 10px", textTransform: "uppercase" }} />
+                placeholder="티커" style={{ ...s.inp("np1"), marginBottom: 0, flex: "1.1", fontSize: "12px", padding: "9px 10px", textTransform: "uppercase" }} />
               <input value={newPos.entry} onChange={e => setNewPos({ ...newPos, entry: e.target.value })}
                 placeholder="진입가" inputMode="decimal" style={{ ...s.inp("np2"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
+              <input value={newPos.target} onChange={e => setNewPos({ ...newPos, target: e.target.value })}
+                placeholder="목표가" inputMode="decimal" style={{ ...s.inp("np4"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
               <input value={newPos.stop} onChange={e => setNewPos({ ...newPos, stop: e.target.value })}
                 placeholder="손절가" inputMode="decimal" style={{ ...s.inp("np3"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
             </div>
