@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { buildScreenerUniverse, evalScreenerModes } from "./screenerData";
 
 const INTERPRET_PROMPT = `You are a seasoned swing trading STRATEGIST (not a checklist analyst). You receive PRE-CALCULATED indicators from REAL daily price data — trust these numbers, never recalculate. Your job is not to "score" indicators but to think like a risk manager: weave the signals into a coherent picture, decide how to protect capital first and capture upside second, and form a concrete plan. Holding horizon: days to a few weeks.
 
@@ -695,6 +696,17 @@ export default function App() {
   const gistRef = useRef({ token: "", id: "" });
   const stateRef = useRef({ positions: [], accountSize: null, riskPct: 1, history: [] });
 
+  // ── 스크리너 상태 ─────────────────────────────────────────────
+  const [showScreener, setShowScreener] = useState(false);
+  const [scanStatus, setScanStatus] = useState("idle"); // idle | running | done
+  const [scanProgress, setScanProgress] = useState({ cur: 0, total: 0, sym: "", batch: 0, totalBatches: 0, waitSec: 0 });
+  const [scanResults, setScanResults] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("wz_scanResults") || "[]"); } catch { return []; }
+  });
+  const [scanSeed, setScanSeed] = useState(() => localStorage.getItem("wz_scanSeed") || null);
+  const [scanDate, setScanDate] = useState(() => localStorage.getItem("wz_scanDate") || null);
+  const scanAbortRef = useRef(false);
+
   useEffect(() => {
     stateRef.current = { positions, accountSize, riskPct, history };
   }, [positions, accountSize, riskPct, history]);
@@ -776,6 +788,91 @@ export default function App() {
   };
 
   const removePosition = (t) => savePositions(positions.filter(p => p.ticker !== t));
+
+  const runScreener = async () => {
+    if (!tdKey.trim()) { setError("Twelve Data API 키를 입력해주세요"); return; }
+    scanAbortRef.current = false;
+    setScanStatus("running");
+    setScanResults([]);
+    setError(null);
+
+    const fixed = positions.map(p => p.ticker);
+    const universe = buildScreenerUniverse(fixed, 150);
+    setScanSeed(String(universe.effectiveSeed));
+    try { localStorage.setItem("wz_scanSeed", String(universe.effectiveSeed)); } catch {}
+
+    const BATCH_SIZE = 8;
+    const BATCH_DELAY_MS = 63_000;
+    const INTRA_DELAY_MS = 400;
+    const batches = [];
+    for (let i = 0; i < universe.tickers.length; i += BATCH_SIZE) {
+      batches.push(universe.tickers.slice(i, i + BATCH_SIZE));
+    }
+
+    const candidates = [];
+    let scanned = 0;
+
+    outer: for (let bi = 0; bi < batches.length; bi++) {
+      const batch = batches[bi];
+      const batchStart = Date.now();
+
+      for (let si = 0; si < batch.length; si++) {
+        if (scanAbortRef.current) break outer;
+        const sym = batch[si];
+        scanned++;
+        setScanProgress({ cur: scanned, total: universe.tickers.length, sym, batch: bi + 1, totalBatches: batches.length, waitSec: 0 });
+
+        try {
+          const resp = await fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=260&apikey=${tdKey.trim()}`);
+          const td = await resp.json();
+          if (!td.values || td.status === "error") throw new Error(td.message || "no data");
+          const ind = computeIndicators(td.values);
+          const modeResult = evalScreenerModes(ind);
+          if (modeResult) {
+            const candidate = {
+              ticker: sym,
+              source: universe.sources[sym],
+              price: ind.current_price,
+              rsi: ind.indicators.rsi.value,
+              fromH52: ind.indicators.pos52w.fromH,
+              volRatio: Math.round(ind.raw.volRatio * 100) / 100,
+              modes: modeResult,
+            };
+            candidates.push(candidate);
+            setScanResults([...candidates]);
+          }
+        } catch { /* silent skip */ }
+
+        if (si < batch.length - 1) await new Promise(r => setTimeout(r, INTRA_DELAY_MS));
+      }
+
+      // 배치 간 대기 (마지막 배치 제외)
+      if (bi < batches.length - 1 && !scanAbortRef.current) {
+        const elapsed = Date.now() - batchStart;
+        const remaining = Math.max(0, BATCH_DELAY_MS - elapsed);
+        if (remaining > 0) {
+          const waitEnd = Date.now() + remaining;
+          await new Promise(resolve => {
+            const timer = setInterval(() => {
+              if (scanAbortRef.current) { clearInterval(timer); resolve(); return; }
+              const left = Math.ceil((waitEnd - Date.now()) / 1000);
+              if (left <= 0) { clearInterval(timer); resolve(); return; }
+              setScanProgress(p => ({ ...p, sym: "", waitSec: left }));
+            }, 1000);
+          });
+          setScanProgress(p => ({ ...p, waitSec: 0 }));
+        }
+      }
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    setScanDate(today);
+    setScanStatus(scanAbortRef.current ? "idle" : "done");
+    try {
+      localStorage.setItem("wz_scanResults", JSON.stringify(candidates));
+      localStorage.setItem("wz_scanDate", today);
+    } catch {}
+  };
 
   const updatePositionLevels = (ticker, newStop, newTarget) => {
     savePositions(positions.map(p =>
@@ -1026,6 +1123,10 @@ export default function App() {
           <button style={s.btn2} onClick={() => setShowPos(v => !v)} disabled={analyzing}>
             내 포지션 {positions.length > 0 ? `(${positions.length})` : ""} {showPos ? "▴" : "▾"}
           </button>
+          <button style={{ ...s.btn2, color: showScreener ? "#00e5a0" : "#607d9f", borderColor: showScreener ? "#00e5a044" : "#182434" }}
+            onClick={() => setShowScreener(v => !v)} disabled={analyzing}>
+            스크리너 {scanResults.length > 0 ? `(${scanResults.length})` : ""} {showScreener ? "▴" : "▾"}
+          </button>
         </div>
 
         {showPos && (
@@ -1086,6 +1187,157 @@ export default function App() {
               <button style={{ ...s.btn, flex: 1.5 }} onClick={analyzePositions} disabled={analyzing}>보유 전체 분석</button>
             </div>
             <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px" }}>※ 이 기기 브라우저에만 저장돼요 (캐시 삭제 시 사라짐)</div>
+          </div>
+        )}
+
+        {/* ── 스크리너 패널 ─────────────────────────────────── */}
+        {showScreener && (
+          <div style={{ ...s.card, padding: "14px 16px", marginBottom: "14px" }}>
+            <div style={{ ...s.lbl, marginBottom: "12px" }}>종목 스크리너 · S&P 500</div>
+
+            {/* IDLE: 스캔 시작 전 */}
+            {scanStatus === "idle" && (
+              <div>
+                <div style={{ fontSize: "11px", color: "#607d9f", lineHeight: "1.7", marginBottom: "12px" }}>
+                  S&P 500 중 최대 150종목 스캔 · 약 20분 소요<br />
+                  보유 종목 <span style={{ color: "#e8f0fe" }}>{positions.length}개</span> 고정 포함 · 나머지 랜덤 샘플<br />
+                  {scanDate && scanResults.length > 0 && (
+                    <span style={{ color: "#334d66" }}>마지막 스캔: {scanDate} · {scanResults.length}종목 발굴됨</span>
+                  )}
+                </div>
+                <button style={{ ...s.btn, flex: "none", width: "100%", background: "#00e5a0", color: "#070d18", border: "1px solid #00e5a0" }}
+                  onClick={runScreener}>
+                  스캔 시작
+                </button>
+                {scanResults.length > 0 && (
+                  <button style={{ ...s.btn2, width: "100%", marginTop: "8px", color: "#607d9f" }}
+                    onClick={() => setScanStatus("done")}>
+                    지난 결과 보기 ({scanResults.length}종목)
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* RUNNING: 스캔 진행 중 */}
+            {scanStatus === "running" && (
+              <div>
+                <div style={{ height: "2px", background: "#182434", borderRadius: "1px", overflow: "hidden", marginBottom: "12px" }}>
+                  <div style={{ height: "100%", width: `${scanProgress.total > 0 ? (scanProgress.cur / scanProgress.total) * 100 : 0}%`, background: "#00e5a0", transition: "width 0.4s ease" }} />
+                </div>
+                <div style={{ fontSize: "11px", color: "#607d9f", marginBottom: "8px" }}>
+                  {scanProgress.waitSec > 0 ? (
+                    <span style={{ color: "#ffb830" }}>⏳ 배치 {scanProgress.batch}/{scanProgress.totalBatches} 완료 · 다음 배치까지 {scanProgress.waitSec}초 대기 중...</span>
+                  ) : (
+                    <span>{scanProgress.cur}/{scanProgress.total} <span style={{ color: "#e8f0fe" }}>{scanProgress.sym}</span> · 배치 {scanProgress.batch}/{scanProgress.totalBatches}</span>
+                  )}
+                </div>
+                <div style={{ fontSize: "10px", color: "#00e5a0", marginBottom: "12px" }}>
+                  발굴 <span style={{ fontWeight: "700", fontSize: "14px" }}>{scanResults.length}</span>종목
+                </div>
+                {scanResults.length > 0 && (
+                  <div style={{ fontSize: "10px", color: "#607d9f", marginBottom: "12px" }}>
+                    {scanResults.map(c => (
+                      <span key={c.ticker} style={{ display: "inline-block", margin: "2px 4px 2px 0", padding: "2px 6px", border: `1px solid ${Object.keys(c.modes).includes("A") ? "#00e5a044" : "#ffb83044"}`, borderRadius: "2px", color: Object.keys(c.modes).includes("A") ? "#00e5a0" : "#ffb830" }}>
+                        {c.ticker} {Object.keys(c.modes).map(id => `[${id}]`).join("")}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <button style={{ ...s.btn2, width: "100%", color: "#ff4757", borderColor: "#ff475733" }}
+                  onClick={() => { scanAbortRef.current = true; }}>
+                  스캔 중단
+                </button>
+                <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px" }}>※ 스캔 중 탭을 닫으면 중단됩니다</div>
+              </div>
+            )}
+
+            {/* DONE: 스캔 완료 결과 */}
+            {scanStatus === "done" && (
+              <div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "12px" }}>
+                  <div style={{ fontSize: "11px", color: "#607d9f" }}>
+                    스캔 완료 · {scanDate && <span>{scanDate} </span>}
+                    {scanSeed && <span style={{ color: "#334d66" }}>seed:{scanSeed}</span>}
+                  </div>
+                  <div style={{ fontSize: "16px", fontWeight: "700", color: "#00e5a0" }}>{scanResults.length}종목 발굴</div>
+                </div>
+
+                {scanResults.length === 0 ? (
+                  <div style={{ fontSize: "11px", color: "#334d66", marginBottom: "12px" }}>조건을 충족한 종목이 없어요</div>
+                ) : (
+                  <div style={{ marginBottom: "12px" }}>
+                    {/* 헤더 */}
+                    <div style={{ display: "grid", gridTemplateColumns: "70px 36px 1fr 50px 48px 52px", gap: "6px", padding: "4px 0", borderBottom: "1px solid #182434", marginBottom: "4px" }}>
+                      {["티커", "출처", "모드 · 조건", "RSI", "52H%", "거래량"].map(h => (
+                        <div key={h} style={{ fontSize: "8px", color: "#334d66", letterSpacing: "1px" }}>{h}</div>
+                      ))}
+                    </div>
+                    {scanResults.map(c => (
+                      <div key={c.ticker} style={{ display: "grid", gridTemplateColumns: "70px 36px 1fr 50px 48px 52px", gap: "6px", padding: "6px 0", borderBottom: "1px solid #0d1825", alignItems: "center" }}>
+                        <div style={{ fontWeight: "700", fontSize: "12px", color: "#e8f0fe" }}>{c.ticker}</div>
+                        <div style={{ fontSize: "9px", color: c.source === "fixed" ? "#00e5a0" : "#607d9f" }}>
+                          {c.source === "fixed" ? "보유" : "랜덤"}
+                        </div>
+                        <div>
+                          {Object.entries(c.modes).map(([id, m]) => (
+                            <span key={id} style={{ display: "inline-block", marginRight: "4px", marginBottom: "2px", fontSize: "9px", padding: "1px 5px", borderRadius: "2px",
+                              background: id === "A" ? "#00e5a018" : "#ffb83018",
+                              color: id === "A" ? "#00e5a0" : "#ffb830",
+                              border: `1px solid ${id === "A" ? "#00e5a033" : "#ffb83033"}` }}>
+                              {id}:{m.name} {m.count}/{m.total}
+                            </span>
+                          ))}
+                          <div style={{ fontSize: "8px", color: "#334d66", marginTop: "1px" }}>
+                            {Object.values(c.modes)[0]?.tags.join(" · ")}
+                          </div>
+                        </div>
+                        <div style={{ fontSize: "11px", color: c.rsi >= 50 ? "#e8f0fe" : "#00e5a0" }}>{c.rsi}</div>
+                        <div style={{ fontSize: "11px", color: c.fromH52 >= -5 ? "#ffb830" : "#607d9f" }}>{c.fromH52}%</div>
+                        <div style={{ fontSize: "11px", color: c.volRatio >= 1.5 ? "#00e5a0" : "#607d9f" }}>{c.volRatio}x</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {scanResults.length > 0 && (() => {
+                  const modeA = scanResults.filter(c => c.modes.A);
+                  const modeB = scanResults.filter(c => c.modes.B);
+                  const loadTickers = (list) => {
+                    setInput(list.map(c => c.ticker).join(", "));
+                    setShowScreener(false);
+                    window.scrollTo({ top: 0, behavior: "smooth" });
+                  };
+                  return (
+                    <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
+                      {modeA.length > 0 && (
+                        <button style={{ ...s.btn, flex: 1, background: "#00e5a0", color: "#070d18", border: "1px solid #00e5a0", fontSize: "10px" }}
+                          onClick={() => loadTickers(modeA)}>
+                          모드 A 분석<br/><span style={{ fontSize: "9px", opacity: 0.7 }}>추세추종 {modeA.length}종목</span>
+                        </button>
+                      )}
+                      {modeB.length > 0 && (
+                        <button style={{ ...s.btn, flex: 1, background: "#ffb830", color: "#070d18", border: "1px solid #ffb830", fontSize: "10px" }}
+                          onClick={() => loadTickers(modeB)}>
+                          모드 B 분석<br/><span style={{ fontSize: "9px", opacity: 0.7 }}>역추세반등 {modeB.length}종목</span>
+                        </button>
+                      )}
+                      {scanResults.length > 0 && (
+                        <button style={{ ...s.btn2, flex: 1, fontSize: "10px" }}
+                          onClick={() => loadTickers(scanResults)}>
+                          전체<br/><span style={{ fontSize: "9px" }}>{scanResults.length}종목</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button style={{ ...s.btn2, flex: 1 }}
+                    onClick={() => { setScanStatus("idle"); }}>
+                    다시 스캔
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
