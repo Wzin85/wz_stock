@@ -53,3 +53,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: node screener/pushToGist.js
+
+      - name: Send Slack notification
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          JOB_STATUS: ${{ job.status }}
+        run: node screener/notify.js
