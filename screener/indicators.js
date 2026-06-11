@@ -1,8 +1,10 @@
-// ── App.jsx에서 추출한 순수 지표 함수 ────────────────────────
-// (스크리너 전용 — 무거운 지표는 제외)
+// ── 지표 계산 + API fetch ─────────────────────────────────────
+// computeIndicators: 순수 함수 (캐시 재사용 가능)
+// fetchRaw: HTTP 호출 + 429 자동 재시도
 
 import { SCREENER_CONFIG } from "./config.js";
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
 
 function calcRSI(closes, period = 14) {
@@ -28,9 +30,9 @@ function calcBollinger(closes, period = 20, mult = 2) {
   return { upper: m + mult * sd, middle: m, lower: m - mult * sd };
 }
 
-function computeIndicators(values) {
-  // values: Twelve Data 응답 (최신→과거 순)
-  const data = [...values].reverse(); // 과거→최신 정렬
+// values: Twelve Data 응답 (최신→과거 순)
+export function computeIndicators(values) {
+  const data = [...values].reverse();
   const closes = data.map(d => parseFloat(d.close));
   const highs  = data.map(d => parseFloat(d.high));
   const lows   = data.map(d => parseFloat(d.low));
@@ -45,10 +47,9 @@ function computeIndicators(values) {
   const bbRange = bb.upper - bb.lower;
   const bbPos = bbRange > 0 ? (cur - bb.lower) / bbRange : 0.5;
 
-  const avgVol  = avg(vols.slice(-20));
+  const avgVol   = avg(vols.slice(-20));
   const volRatio = avgVol > 0 ? vols[n - 1] / avgVol : 1;
 
-  // ATR(14)
   const atrLook = Math.min(14, n - 1);
   let trSum = 0;
   for (let i = n - atrLook; i < n; i++) {
@@ -60,26 +61,39 @@ function computeIndicators(values) {
   }
   const atrPct = atrLook > 0 ? (trSum / atrLook / cur) * 100 : 0;
 
-  // 52주 위치
-  const lb  = Math.min(252, n);
-  const h52 = Math.max(...highs.slice(-lb));
-  const l52 = Math.min(...lows.slice(-lb));
+  const lb     = Math.min(252, n);
+  const h52    = Math.max(...highs.slice(-lb));
+  const l52    = Math.min(...lows.slice(-lb));
   const fromH52 = h52 > 0 ? ((cur - h52) / h52) * 100 : 0;
   const pos52w  = h52 > l52 ? Math.round(((cur - l52) / (h52 - l52)) * 100) : 50;
 
   return { cur, rsi, ma20, ma50, bbPos, volRatio, atrPct, fromH52, pos52w, h52, l52 };
 }
 
-export async function fetchIndicators(sym, apiKey, cfg = SCREENER_CONFIG) {
+// 429 자동 재시도 포함 raw values fetch
+// onRetry 콜백: 429 발생 시 진행 표시줄 업데이트용
+export async function fetchRaw(sym, apiKey, cfg = SCREENER_CONFIG, onRetry = null) {
   const url =
     `${cfg.apiBaseUrl}/time_series` +
     `?symbol=${sym}&interval=${cfg.interval}&outputsize=${cfg.outputsize}&apikey=${apiKey}`;
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  if (json.status === "error" || !json.values) throw new Error(json.message || "데이터 없음");
-  if (json.values.length < 55) throw new Error("데이터 부족 (MA50 계산 불가)");
+  for (let attempt = 0; attempt < cfg.retryMaxAttempts; attempt++) {
+    const res = await fetch(url);
 
-  return computeIndicators(json.values);
+    if (res.status === 429) {
+      const waitMs = cfg.retryWaitMs;
+      if (onRetry) onRetry(attempt + 1, cfg.retryMaxAttempts, waitMs);
+      await sleep(waitMs);
+      continue;
+    }
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const json = await res.json();
+    if (json.status === "error" || !json.values) throw new Error(json.message || "데이터 없음");
+    if (json.values.length < 55) throw new Error("데이터 부족 (MA50 계산 불가)");
+
+    return json.values;
+  }
+  throw new Error(`429 재시도 ${cfg.retryMaxAttempts}회 초과`);
 }
