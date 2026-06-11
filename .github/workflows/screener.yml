@@ -1,6 +1,10 @@
 name: Stock Screener (Server)
 
 on:
+  # 매일 오후 3:30 KST (06:30 UTC), 평일만
+  schedule:
+    - cron: '30 6 * * 1-5'
+  # 앱에서 수동 트리거
   workflow_dispatch:
     inputs:
       holdings:
@@ -24,12 +28,22 @@ jobs:
         with:
           node-version: "20"
 
+      # 자동 스케줄 실행 시 Gist에서 보유 종목 읽기
+      - name: Get holdings from Gist
+        id: holdings
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: echo "tickers=$(node screener/getHoldings.js)" >> $GITHUB_OUTPUT
+
       - name: Run screener
         env:
           TD_API_KEY: ${{ secrets.TD_API_KEY }}
-          HOLDINGS: ${{ inputs.holdings }}
-          SEED: ${{ inputs.seed }}
         run: |
+          # 수동 트리거면 inputs.holdings 우선, 없으면 Gist에서 읽은 값 사용
+          HOLDINGS="${{ inputs.holdings }}"
+          [ -z "$HOLDINGS" ] && HOLDINGS="${{ steps.holdings.outputs.tickers }}"
+          SEED="${{ inputs.seed }}"
+
           CMD="node screener/screener.js --apikey $TD_API_KEY"
           [ -n "$HOLDINGS" ] && CMD="$CMD --holdings $HOLDINGS"
           [ -n "$SEED"     ] && CMD="$CMD --seed $SEED"
