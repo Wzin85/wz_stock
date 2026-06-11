@@ -1,84 +1,91 @@
-// ── 스크리닝 유니버스 ─────────────────────────────────────────
-// UNIVERSE export를 교체하면 스캔 대상 전체가 바뀜
-// TOP150: 시총·거래량 상위 150 종목 (기본값, 하루 800 크레딧 내 수용)
-// NASDAQ100 / SP500: 필요 시 [...new Set([...NASDAQ100,...SP500])] 로 확장
+// ── 유니버스 빌더 ─────────────────────────────────────────────
+// buildUniverse(): 고정(워치리스트+보유) + 랜덤 샘플 조합
+// S&P 500 전체 목록은 sp500.json에 보관 (API 크레딧 0)
 
-// ── 시총·거래량 상위 150 종목 ─────────────────────────────────
-export const TOP150 = [
-  // 빅테크·플랫폼 (10)
-  "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","ORCL",
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
-  // 반도체 (15)
-  "AMD","QCOM","TXN","INTC","MU","AMAT","LRCX","KLAC","ASML","ARM",
-  "ADI","ON","MRVL","NXPI","SMCI",
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 
-  // 소프트웨어·클라우드·사이버보안 (15)
-  "ACN","CSCO","IBM","CRM","ADBE","INTU","NOW","PANW","CRWD","DDOG",
-  "ZS","FTNT","PLTR","WDAY","CDNS",
+// sp500.json 로드 (정적 파일, 절대 API 호출 없음)
+function loadSP500() {
+  const data = require(path.join(__dirname, "sp500.json"));
+  // 중복 제거 후 반환
+  return [...new Set(data.tickers.map(t => t.toUpperCase()))];
+}
 
-  // 금융 (15)
-  "V","MA","JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP",
-  "SPGI","MCO","CME","ICE","C",
+// ── 시드 기반 PRNG (mulberry32) ──────────────────────────────
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
-  // 헬스케어·바이오 (15)
-  "UNH","LLY","JNJ","ABBV","MRK","ABT","TMO","DHR","PFE","BMY",
-  "AMGN","GILD","VRTX","REGN","ISRG",
+// 시드 기반 Fisher-Yates 셔플 후 앞에서 n개 추출
+function sampleN(arr, n, seed) {
+  if (n <= 0) return [];
+  if (n >= arr.length) return [...arr];
+  const rng = mulberry32(seed);
+  const pool = [...arr];
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, n);
+}
 
-  // 임의소비재 (15)
-  "HD","MCD","COST","NKE","SBUX","LOW","TGT","TJX","BKNG","UBER",
-  "HLT","MAR","ABNB","F","GM",
+// ── 유니버스 구성 ─────────────────────────────────────────────
+/**
+ * @param {string[]} watchlist  - 워치리스트 티커
+ * @param {string[]} holdings   - 보유 종목 티커
+ * @param {number}   maxSize    - 총 유니버스 크기 (기본 150)
+ * @param {number|null} seed    - 랜덤 시드 (null이면 Date.now() 사용)
+ * @returns {{ tickers, sources, effectiveSeed, stats }}
+ */
+export function buildUniverse(watchlist = [], holdings = [], maxSize = 150, seed = null) {
+  const sp500 = loadSP500();
 
-  // 필수소비재 (10)
-  "WMT","PG","KO","PEP","MO","PM","CL","CLX","EL","KHC",
+  // 고정 슬롯: 워치리스트 + 보유 (중복 제거, 대문자 통일)
+  const fixed = [...new Set([
+    ...watchlist.map(t => t.toUpperCase()),
+    ...holdings.map(t => t.toUpperCase()),
+  ])];
 
-  // 커뮤니케이션·미디어 (10)
-  "NFLX","DIS","CMCSA","T","VZ","TMUS","EA","RBLX","TTWO","WBD",
+  // 고정 종목이 S&P500 목록 밖이어도 그대로 포함
+  const fixedSet = new Set(fixed);
+  const pool = sp500.filter(t => !fixedSet.has(t));
 
-  // 에너지 (10)
-  "XOM","CVX","COP","SLB","EOG","HAL","MPC","VLO","OXY","DVN",
+  const needed = Math.max(0, maxSize - fixed.length);
+  const effectiveSeed = seed !== null ? Number(seed) : Date.now();
+  const sampled = sampleN(pool, needed, effectiveSeed);
 
-  // 산업재 (15)
-  "GE","BA","CAT","HON","RTX","LMT","UPS","EMR","ETN","DE",
-  "NOC","GD","ITW","CSX","UNP",
+  // 출처 맵: "fixed" | "random"
+  const sources = {};
+  for (const t of fixed)   sources[t] = "fixed";
+  for (const t of sampled) sources[t] = "random";
 
-  // 소재 (10)
-  "LIN","APD","SHW","ECL","FCX","NEM","ALB","NUE","CF","AVY",
+  return {
+    tickers: [...fixed, ...sampled],
+    sources,
+    effectiveSeed,
+    stats: {
+      total: fixed.length + sampled.length,
+      fixed: fixed.length,
+      random: sampled.length,
+      sp500Pool: sp500.length,
+      watchlist: watchlist.length,
+      holdings: holdings.length,
+    },
+  };
+}
 
-  // 부동산·유틸리티 (10)
-  "AMT","PLD","EQIX","CCI","NEE","DUK","SO","D","SPG","AWK",
-];
-
-// ── 확장 유니버스 (필요 시 UNIVERSE = FULL_UNIVERSE 로 교체) ─
-export const NASDAQ100 = [
-  "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","TSLA","AVGO","COST",
-  "ASML","NFLX","AMD","AZN","TMUS","QCOM","LIN","PEP","CSCO","TXN",
-  "ADBE","INTU","AMGN","HON","BKNG","VRTX","SBUX","ISRG","SNY","GILD",
-  "MDLZ","ADI","REGN","PANW","ADP","MU","LRCX","KLAC","CRWD","INTC",
-  "MELI","CDNS","AMAT","MRNA","SNPS","MAR","ORLY","PYPL","FTNT","MNST",
-  "PCAR","CTAS","ODFL","WDAY","MCHP","BIIB","ABNB","IDXX","KDP","EXC",
-  "TTWO","DLTR","FAST","ILMN","ROST","ZS","NXPI","DXCM","WBD","VRSK",
-  "TEAM","DDOG","ON","CPRT","FANG","SMCI","CEG","DASH","TTD","ARM",
-  "GEHC","PLTR","GFS","MRVL","ROP",
-];
-
-export const SP500 = [
-  "NOW","ORCL","CRM","IBM","ACN","DELL","HPQ","HPE","GLW","ANET","VRT","FIS","FISV","GPN","CTSH",
-  "UNH","JNJ","LLY","ABBV","MRK","ABT","TMO","DHR","BMY","PFE",
-  "CI","HUM","CVS","MCK","ELV","CNC","MOH","HCA","SYK","BSX","MDT","EW","BDX","BAX","RMD","DGX","LH","MTD","VEEV","ALGN",
-  "JPM","BAC","WFC","GS","MS","C","BLK","SCHW","AXP","PGR",
-  "TRV","MCO","SPGI","CME","ICE","COF","DFS","SYF","HIG","MET",
-  "PRU","AFL","AIG","ALL","MMC","AON","BK","STT","USB","PNC","TFC","MTB","CFG","RF","KEY","CINF","CB","WTW","ALLY",
-  "HD","MCD","NKE","LOW","TGT","TJX","ULTA","MGM","RCL","CCL","NCLH","HLT","EXPE","UBER","F","GM","LEN","DHI","PHM","EBAY","ETSY","BBY","GPC","WYNN","LVS",
-  "WMT","PG","KO","KHC","GIS","MKC","HSY","CL","CLX","EL","MO","PM","STZ","WBA","SYY","TSN","HRL","CAG","CHD","CELH",
-  "XOM","CVX","COP","SLB","EOG","MPC","VLO","PSX","OXY","HES","HAL","DVN","BKR","CTRA","APA","EQT",
-  "BA","CAT","GE","UPS","LMT","RTX","NOC","GD","TDG","MMM","EMR","ROK","AME","PH","ETN","IR","ITW","GWW","SNA","CMI","DE","CSX","UNP","NSC","WM","RSG","JBHT","EXPD","CHRW","AZO","AXON",
-  "APD","PPG","SHW","ECL","ALB","FCX","NEM","NUE","STLD","CF","MOS","IP","PKG","LYB","EMN","AA","X","CLF","FMC","AVY",
-  "AMT","PLD","EQIX","CCI","DLR","SPG","O","VICI","PSA","WELL","EQR","AVB","ARE","BXP","KIM","NNN",
-  "NEE","DUK","SO","D","AEE","PPL","WEC","ED","SRE","PCG","ETR","FE","AWK","CMS","CNP","AES",
-  "DIS","CMCSA","T","VZ","CHTR","EA","RBLX","MTCH","OMC","IPG","FOXA","NWS",
-];
-
-export const FULL_UNIVERSE = [...new Set([...NASDAQ100, ...SP500])];
-
-// ── 기본 유니버스 (여기를 바꿔서 스캔 대상 교체) ─────────────
-export const UNIVERSE = TOP150;
+// 로드 검증용 (테스트 목적)
+export function getSP500Count() {
+  return loadSP500().length;
+}
