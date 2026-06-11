@@ -658,7 +658,11 @@ async function findOrCreateGist(token) {
 async function loadGist(token, id) {
   const data = await ghReq("GET", `/gists/${id}`, token);
   const raw = data.files?.[GIST_FILE]?.content;
-  return raw ? JSON.parse(raw) : null;
+  const screenerRaw = data.files?.["wz_screener.json"]?.content;
+  return {
+    main: raw ? JSON.parse(raw) : null,
+    screener: screenerRaw ? JSON.parse(screenerRaw) : null,
+  };
 }
 
 async function pushGist(token, id, payload) {
@@ -734,18 +738,27 @@ export default function App() {
     try {
       const id = await findOrCreateGist(t);
       gistRef.current = { token: t, id };
-      const data = await loadGist(t, id);
-      if (data) {
+      const { main, screener } = await loadGist(t, id);
+      if (main) {
         const localPos = stateRef.current.positions;
-        if (data.positions?.length) {
-          setPositions(data.positions);
+        if (main.positions?.length) {
+          setPositions(main.positions);
         } else if (localPos.length) {
-          // 로컬 데이터를 Gist로 마이그레이션
           await pushGist(t, id, { positions: localPos, settings: { accountSize: null, riskPct: 1 }, history: [] });
         }
-        if (data.settings?.accountSize != null) setAccountSize(data.settings.accountSize);
-        if (data.settings?.riskPct != null) setRiskPct(data.settings.riskPct);
-        if (data.history?.length) setHistory(data.history);
+        if (main.settings?.accountSize != null) setAccountSize(main.settings.accountSize);
+        if (main.settings?.riskPct != null) setRiskPct(main.settings.riskPct);
+        if (main.history?.length) setHistory(main.history);
+      }
+      if (screener?.candidates?.length) {
+        setScanResults(screener.candidates);
+        setScanDate(screener.date || null);
+        setScanSeed(screener.seed ? String(screener.seed) : null);
+        setScanStatus("done");
+        try {
+          localStorage.setItem("wz_scanResults", JSON.stringify(screener.candidates));
+          if (screener.date) localStorage.setItem("wz_scanDate", screener.date);
+        } catch {}
       }
       localStorage.setItem("wz_gistToken", t);
       setGistToken(t);
