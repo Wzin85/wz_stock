@@ -19,10 +19,10 @@ export const MODE_A = {
       fn: ind => ind.cur > ind.ma20,
     },
     {
-      id: "near_52w_high",
-      label: "신고가근접",
-      desc: "52주 고점 대비 -10% 이내",
-      fn: ind => ind.fromH52 >= -10,
+      id: "pos52w_upper",
+      label: "52w중간위",
+      desc: "52주 범위 상위 50% (시장 상황 무관한 상대강도)",
+      fn: ind => ind.pos52w >= 0.5,
     },
     {
       id: "vol_inflow",

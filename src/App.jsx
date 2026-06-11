@@ -1336,7 +1336,7 @@ export default function App() {
                   <div style={{ fontSize: "10px", color: "#607d9f", marginBottom: "12px" }}>
                     {scanResults.map(c => (
                       <span key={c.ticker} style={{ display: "inline-block", margin: "2px 4px 2px 0", padding: "2px 6px", border: `1px solid ${Object.keys(c.modes).includes("A") ? "#00e5a044" : "#ffb83044"}`, borderRadius: "2px", color: Object.keys(c.modes).includes("A") ? "#00e5a0" : "#ffb830" }}>
-                        {c.ticker} {Object.keys(c.modes).map(id => `[${id}]`).join("")}
+                        {c.ticker} {Object.keys(c.modes).map(id => `[${id}]`).join("")}{c.modes.B?.bonus?.length ? " ★" : ""}
                       </span>
                     ))}
                   </div>
@@ -1383,6 +1383,11 @@ export default function App() {
                               color: id === "A" ? "#00e5a0" : "#ffb830",
                               border: `1px solid ${id === "A" ? "#00e5a033" : "#ffb83033"}` }}>
                               {id}:{m.name} {m.count}/{m.total}
+                            </span>
+                          ))}
+                          {c.modes.B?.bonus?.map(tag => (
+                            <span key={tag} style={{ display: "inline-block", marginRight: "3px", marginBottom: "2px", fontSize: "9px", padding: "1px 5px", borderRadius: "2px", background: "#ffffff18", color: "#fff", border: "1px solid #ffffff33" }}>
+                              ★ {tag}
                             </span>
                           ))}
                           <div style={{ fontSize: "8px", color: "#334d66", marginTop: "1px" }}>

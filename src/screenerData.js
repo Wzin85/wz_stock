@@ -108,7 +108,7 @@ export const SCREENER_MODES = [
     conditions: [
       { label: "정배열",    fn: ind => ind.raw.ma20 != null && ind.raw.ma50 != null && ind.raw.ma20 > ind.raw.ma50 },
       { label: "MA20위",   fn: ind => ind.current_price > ind.raw.ma20 },
-      { label: "신고가근접", fn: ind => ind.indicators.pos52w.fromH >= -10 },
+      { label: "52w중간위", fn: ind => ind.indicators.pos52w.pos >= 0.5 },
       { label: "수급유입",  fn: ind => ind.raw.volRatio >= 1.3 },
       { label: "RSI모멘텀", fn: ind => ind.indicators.rsi.value >= 50 && ind.indicators.rsi.value <= 70 },
     ],
@@ -133,6 +133,7 @@ export const SCREENER_MODES = [
 export const SCREENER_MIN_PASS = 4;
 
 // 모드 평가 → 통과한 모드들의 결과 객체 반환 (없으면 null)
+// Mode B 통과 시 RSI 다이버전스/셀링 클라이맥스 보너스 감지 포함
 export function evalScreenerModes(ind) {
   const results = {};
   for (const mode of SCREENER_MODES) {
@@ -147,5 +148,14 @@ export function evalScreenerModes(ind) {
       };
     }
   }
+
+  // Mode B 보너스: 고급 반등 신호 감지 (필수 아님, 표시용)
+  if (results.B) {
+    const bonus = [];
+    if (ind.indicators?.rsiDiv?.type === "bullish") bonus.push("RSI다이버전스");
+    if (ind.indicators?.capitulation?.signal === "capitulation") bonus.push("셀링클라이맥스");
+    if (bonus.length > 0) results.B.bonus = bonus;
+  }
+
   return Object.keys(results).length > 0 ? results : null;
 }
