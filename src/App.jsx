@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from "react";
-import { createChart, CandlestickSeries, LineSeries, HistogramSeries } from "lightweight-charts";
 
 const INTERPRET_PROMPT = `You are a seasoned swing trading STRATEGIST (not a checklist analyst). You receive PRE-CALCULATED indicators from REAL daily price data — trust these numbers, never recalculate. Your job is not to "score" indicators but to think like a risk manager: weave the signals into a coherent picture, decide how to protect capital first and capture upside second, and form a concrete plan. Holding horizon: days to a few weeks.
 
@@ -390,7 +389,7 @@ function computeWeeklyIndicators(values) {
   };
 }
 
-async function analyzeOne(sym, tdKey, anthropicKey, fng, market, sectors, heldPos) {
+async function analyzeOne(sym, tdKey, anthropicKey, fng, market, sectors, heldPos, mode) {
   const [td, wkData, earnings] = await Promise.all([
     fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=260&apikey=${tdKey}`).then(r => r.json()),
     fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1week&outputsize=52&apikey=${tdKey}`).then(r => r.json()).catch(() => null),
@@ -489,6 +488,26 @@ Rules for a held position:
 - Frame ENTRY_ZONE as an "add zone" only if adding makes sense; otherwise set it to the current price.`;
   }
 
+  // 전략 모드: 추세 추종 / 역추세 / 균형
+  let modeMsg = "";
+  if (mode === "reversion") {
+    modeMsg = `
+
+STRATEGY MODE — MEAN REVERSION (counter-trend bounce):
+The user wants to find OVERSOLD BOUNCE setups, not trend continuation. Shift your bias:
+- Favor BUY when the stock is OVERSOLD (RSI low, price at/below lower Bollinger band, near a strong support level) AND showing early signs of a bounce (buying-pressure accumulation via the wick-aware volume signal, or a reclaim of support).
+- A pure downtrend with NO sign of stabilization is NOT a buy — "falling knife." Require at least one stabilization signal (support holding, accumulation, RSI turning up) before a BUY.
+- STOP_LOSS must sit just below the support/recent low you are betting on — if that breaks, the bounce thesis is dead. Keep it tight but below the level.
+- TARGET is typically a reversion toward the mean (MA20 / middle Bollinger / nearest resistance), not a new high.
+- Be honest in BEAR points about the counter-trend risk. Mean reversion has lower win-rate tolerance, so CONFIDENCE should reflect that these are higher-risk setups.`;
+  } else if (mode === "balanced") {
+    modeMsg = `
+
+STRATEGY MODE — BALANCED:
+Consider BOTH trend-continuation and oversold-bounce setups. If the stock is trending cleanly, treat it as trend-following. If it is oversold near strong support with early stabilization (accumulation / RSI turning up), a counter-trend bounce BUY is also valid. Pick whichever framing the data supports best, and state which one you are using in the SUMMARY. Always anchor STOP_LOSS to the level whose break would invalidate that specific thesis.`;
+  }
+  // mode === "trend" (기본): 별도 지시 없음 — 기존 추세 추종 로직 유지
+
   const cres = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -499,7 +518,7 @@ Rules for a held position:
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6", max_tokens: 800, temperature: 0.4,
-      system: INTERPRET_PROMPT, messages: [{ role: "user", content: userMsg + holdingMsg }],
+      system: INTERPRET_PROMPT, messages: [{ role: "user", content: userMsg + modeMsg + holdingMsg }],
     }),
   });
   const cdata = await cres.json();
@@ -512,7 +531,7 @@ Rules for a held position:
     const sc = typeof sectors[secEtf] === "object" ? sectors[secEtf].score : sectors[secEtf];
     if (sc != null) sectorInfo = { score: sc, name: SECTOR_KR[secEtf] || secEtf };
   }
-  return { ticker: sym, ...ind, ...interp, earnings, sector: sectorInfo, ohlcv: td.values, weekly, weeklyOhlcv: wkData?.values ?? null };
+  return { ticker: sym, ...ind, ...interp, earnings, sector: sectorInfo, weekly };
 }
 
 // ── GitHub Gist 동기화 ────────────────────────────────
@@ -557,131 +576,6 @@ async function pushGist(token, id, payload) {
     files: { [GIST_FILE]: { content: JSON.stringify(payload) } },
   });
 }
-// ─────────────────────────────────────────────────────
-
-function StockChart({ ohlcv, weeklyOhlcv, levels }) {
-  const containerRef = useRef(null);
-  const [tf, setTf] = useState("day");
-
-  const activeOhlcv = tf === "week" && weeklyOhlcv?.length ? weeklyOhlcv : ohlcv;
-
-  useEffect(() => {
-    if (!containerRef.current || !activeOhlcv?.length) return;
-
-    const data = [...activeOhlcv].reverse();
-    const closes = data.map(d => parseFloat(d.close));
-
-    const chart = createChart(containerRef.current, {
-      width: containerRef.current.clientWidth,
-      height: 260,
-      layout: { background: { type: "solid", color: "#090e19" }, textColor: "#607d9f" },
-      grid: { vertLines: { color: "#182434" }, horzLines: { color: "#182434" } },
-      crosshair: { mode: 1 },
-      rightPriceScale: { borderColor: "#182434" },
-      timeScale: { borderColor: "#182434", timeVisible: false },
-    });
-
-    // 캔들차트
-    const candles = chart.addSeries(CandlestickSeries, {
-      upColor: "#00e5a0", downColor: "#ff4757",
-      borderUpColor: "#00e5a0", borderDownColor: "#ff4757",
-      wickUpColor: "#00e5a0", wickDownColor: "#ff4757",
-    });
-    candles.setData(data.map(d => ({
-      time: d.datetime.slice(0, 10),
-      open: parseFloat(d.open), high: parseFloat(d.high),
-      low: parseFloat(d.low), close: parseFloat(d.close),
-    })));
-
-    // 거래량 (하단 20%)
-    const vol = chart.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, priceScaleId: "vol" });
-    chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-    vol.setData(data.map(d => ({
-      time: d.datetime.slice(0, 10),
-      value: parseFloat(d.volume),
-      color: parseFloat(d.close) >= parseFloat(d.open) ? "#00e5a028" : "#ff475728",
-    })));
-
-    const maLine = (period, color) => {
-      const s = chart.addSeries(LineSeries, { color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-      s.setData(closes.map((_, i) => {
-        if (i < period - 1) return null;
-        return { time: data[i].datetime.slice(0, 10), value: closes.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0) / period };
-      }).filter(Boolean));
-    };
-
-    if (tf === "week") {
-      // 주봉: MA10w (파랑), MA20w (주황)
-      maLine(10, "#4a9eff");
-      maLine(20, "#ff8c42");
-    } else {
-      // 일봉: MA20, MA50, 볼린저 밴드
-      maLine(20, "#4a9eff");
-      maLine(50, "#ff8c42");
-      const bbLine = (upper) => closes.map((_, i) => {
-        if (i < 19) return null;
-        const sl = closes.slice(i - 19, i + 1);
-        const mean = sl.reduce((a, b) => a + b, 0) / 20;
-        const std = Math.sqrt(sl.map(c => (c - mean) ** 2).reduce((a, b) => a + b, 0) / 20);
-        return { time: data[i].datetime.slice(0, 10), value: upper ? mean + 2 * std : mean - 2 * std };
-      }).filter(Boolean);
-      const bbOpts = { color: "#607d9f66", lineWidth: 1, lineStyle: 2, priceLineVisible: false, lastValueVisible: false };
-      chart.addSeries(LineSeries, bbOpts).setData(bbLine(true));
-      chart.addSeries(LineSeries, bbOpts).setData(bbLine(false));
-    }
-
-    // 지지/저항 수평선 (일봉에서만)
-    if (tf === "day" && levels) {
-      levels.resistances.slice(0, 3).forEach((l, i) => {
-        candles.createPriceLine({
-          price: l.price, color: i === 0 ? "#ff4757cc" : "#ff475766",
-          lineWidth: 1, lineStyle: 1, axisLabelVisible: true,
-          title: `R${i + 1}${l.strength > 1 ? ` ×${l.strength}` : ""}`,
-        });
-      });
-      levels.supports.slice(0, 3).forEach((l, i) => {
-        candles.createPriceLine({
-          price: l.price, color: i === 0 ? "#00e5a0cc" : "#00e5a066",
-          lineWidth: 1, lineStyle: 1, axisLabelVisible: true,
-          title: `S${i + 1}${l.strength > 1 ? ` ×${l.strength}` : ""}`,
-        });
-      });
-    }
-
-    chart.timeScale().fitContent();
-
-    const ro = new ResizeObserver(() => {
-      if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth });
-    });
-    ro.observe(containerRef.current);
-
-    return () => { ro.disconnect(); chart.remove(); };
-  }, [activeOhlcv, tf, levels]);
-
-  return (
-    <div style={{ marginBottom: "12px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "5px" }}>
-        <div style={{ fontSize: "8px", color: "#334d66", letterSpacing: "1px", display: "flex", gap: "10px", flexWrap: "wrap" }}>
-          <span style={{ color: "#4a9eff" }}>— {tf === "week" ? "MA10w" : "MA20"}</span>
-          <span style={{ color: "#ff8c42" }}>— {tf === "week" ? "MA20w" : "MA50"}</span>
-          {tf === "day" && <><span style={{ color: "#607d9f" }}>-- BB</span><span style={{ color: "#ff4757" }}>— 저항</span><span style={{ color: "#00e5a0" }}>— 지지</span></>}
-        </div>
-        {weeklyOhlcv?.length > 0 && (
-          <div style={{ display: "flex", gap: "4px" }}>
-            {["day", "week"].map(t => (
-              <button key={t} onClick={() => setTf(t)}
-                style={{ fontSize: "8px", padding: "2px 7px", borderRadius: "2px", border: `1px solid ${tf === t ? "#00e5a0" : "#182434"}`, background: "transparent", color: tf === t ? "#00e5a0" : "#334d66", cursor: "pointer", fontFamily: "inherit" }}>
-                {t === "day" ? "일봉" : "주봉"}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-      <div ref={containerRef} style={{ width: "100%", borderRadius: "3px", overflow: "hidden" }} />
-    </div>
-  );
-}
-
 export default function App() {
   const [tdKey, setTdKey] = useState(() => { try { return localStorage.getItem("wz_tdKey") || ""; } catch { return ""; } });
   const [anthropicKey, setAnthropicKey] = useState(() => { try { return localStorage.getItem("wz_anthropicKey") || ""; } catch { return ""; } });
@@ -700,6 +594,7 @@ export default function App() {
     catch { return []; }
   });
   const [showPos, setShowPos] = useState(false);
+  const [strategyMode, setStrategyMode] = useState(() => { try { return localStorage.getItem("wz_strategyMode") || "trend"; } catch { return "trend"; } });
   const [newPos, setNewPos] = useState({ ticker: "", entry: "", target: "", stop: "" });
   const [editingPos, setEditingPos] = useState(null); // ticker being edited
   const [editVals, setEditVals] = useState({ entry: "", target: "", stop: "" });
@@ -804,6 +699,7 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem("wz_tdKey", tdKey); } catch {} }, [tdKey]);
   useEffect(() => { try { localStorage.setItem("wz_anthropicKey", anthropicKey); } catch {} }, [anthropicKey]);
   useEffect(() => { try { localStorage.setItem("wz_watchlist", input); } catch {} }, [input]);
+  useEffect(() => { try { localStorage.setItem("wz_strategyMode", strategyMode); } catch {} }, [strategyMode]);
   useEffect(() => { syncToGist({ accountSize, riskPct }); }, [accountSize, riskPct]);
 
   useEffect(() => {
@@ -834,7 +730,7 @@ export default function App() {
       setProgress({ cur: i + 1, total: syms.length, sym: syms[i] });
       try {
         const heldPos = positions.find(p => p.ticker === syms[i]) || null;
-        const res = await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng, market, sectors, heldPos);
+        const res = await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng, market, sectors, heldPos, strategyMode);
         const pos = positions.find(p => p.ticker === syms[i]);
         if (pos) {
           const pnlPct = ((res.current_price - pos.entry) / pos.entry) * 100;
@@ -1020,6 +916,22 @@ export default function App() {
           onFocus={() => setFocused("tk")} onBlur={() => setFocused("")}
           placeholder="티커 입력 (쉼표로 구분: NVDA, AAPL, TSLA)" />
 
+        <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+          {[
+            { id: "trend", label: "추세 추종" },
+            { id: "reversion", label: "역추세 반등" },
+            { id: "balanced", label: "균형" },
+          ].map(m => (
+            <button key={m.id} onClick={() => setStrategyMode(m.id)} disabled={analyzing}
+              style={{ ...s.btn2, flex: 1, padding: "9px 6px", fontSize: "10px",
+                color: strategyMode === m.id ? "#00e5a0" : "#607d9f",
+                borderColor: strategyMode === m.id ? "#00e5a044" : "#182434",
+                background: strategyMode === m.id ? "#00e5a00a" : "#0b1522" }}>
+              {m.label}
+            </button>
+          ))}
+        </div>
+
         <div style={s.btnRow}>
           <button style={s.btn} onClick={() => runAnalysis(input.split(/[,\s]+/))} disabled={analyzing}>
             {analyzing ? `분석 중 ${progress.cur}/${progress.total} · ${progress.sym}` : "ANALYZE"}
@@ -1144,7 +1056,6 @@ export default function App() {
 
               {open && (
                 <div style={{ ...s.card, borderColor: rc + "33", borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
-                  {r.ohlcv && <StockChart ohlcv={r.ohlcv} weeklyOhlcv={r.weeklyOhlcv} levels={r.indicators?.levels?.swingLevels} />}
                   {r.position && (
                     <div style={{ marginBottom: "10px", padding: "10px 12px", borderRadius: "3px", background: r.position.status.col + "12", border: `1px solid ${r.position.status.col}44` }}>
                       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
