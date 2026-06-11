@@ -32,6 +32,7 @@ Rules:
 - COMPANY: the Korean name of the company for the given ticker
 - RECOMMENDATION must be exactly BUY, HOLD, or SELL
 - BE DECISIVE: HOLD only when there is genuinely no actionable edge for a swing trade — not as a way to avoid committing. When evidence leans, commit and express strength via CONFIDENCE (3-4 weak/speculative, 5-6 moderate, 7-9 strong/clean).
+- WEIGHTING PHILOSOPHY: Combine the indicators with RELATIVELY FLAT importance — most indicators should carry similar weight so that no single indicator dominates the verdict. Some indicators naturally matter a bit more than others, but keep the GAP between high- and low-importance indicators small (gentle, not extreme). The ONLY exceptions that may carry outsized weight are hard risk/invalidation signals: a broken stop level, earnings imminent (within ~5 days), or a confirmed breakdown of the thesis level. Everything else is weighed evenly and synthesized.
 - The SUMMARY must read like a strategist's verdict, weaving 2-3 factors together (e.g. "추세는 살아있으나 저항 코앞 + 실적 임박, 보수적 접근"), NOT a list of indicator values.
 - At least one BEAR line should state the INVALIDATION level or the single biggest risk, not a generic caveat.
 - STOP_LOSS = invalidation level: below the support level OR ~2x ATR below price (whichever gives the trade sensible room for its volatility). TARGET_PRICE = next resistance or a realistic multiple of the risk. ENTRY_ZONE near current price/support.
@@ -39,8 +40,8 @@ Rules:
 - CATALYST is replaced by SETUP: describe the core TECHNICAL setup in Korean (e.g. "정배열 눌림목 지지 후 재상승", "과매도 다이버전스 + 셀링 클라이맥스 반등 시도", "저항 돌파 실패 후 약세"). This is about chart structure, NOT news. Do NOT invent news, earnings dates, or numbers.
 - CONFIDENCE_WHY: one short Korean sentence explaining WHY you assigned this confidence number — cite the 1-2 factors that most raised or lowered it (e.g. "주봉·일봉 정렬은 강하나 손익비 1.6으로 다소 낮아 7에서 깎음"). This makes the score auditable.
 - EARNINGS within ~14 days = major overnight gap risk: cut CONFIDENCE hard and make it a BEAR point. Within 5 days, lean HOLD unless exceptional.
-- MARKET TREND: trading against a SPY/QQQ downtrend lowers odds — cut CONFIDENCE for BUYs. Strong stock + strong market = best setup.
-- SECTOR: weak sector (<~40) is a headwind, strong (>~60) a tailwind — weave into confidence/reasoning when notable.
+- MARKET TREND: trading against a SPY/QQQ downtrend lowers odds — cut CONFIDENCE for BUYs. Strong stock + strong market = best setup. (EXCEPTION: in MEAN REVERSION mode this is overridden — see that mode's instructions.)
+- SECTOR: weak sector (<~40) is a headwind, strong (>~60) a tailwind — weave into confidence/reasoning when notable. (EXCEPTION: in MEAN REVERSION mode a weak sector is treated as oversold context, not a cut.)
 - ATR: high-volatility names need wider stops; never set a stop so tight it gets shaken out by normal daily range.
 - IMPORTANT — do NOT fabricate specific historical precedents, dates, or past return figures (e.g. "in 2020 this pattern returned X%"). You may reason about what indicator combinations TYPICALLY imply in general terms, but never invent concrete past cases or statistics.
 - ALL text (SUMMARY, BULL, BEAR, COMPANY) MUST be natural Korean
@@ -573,9 +574,11 @@ The user wants to find OVERSOLD BOUNCE setups, not trend continuation. Shift you
 - STOP_LOSS must sit just below the support/recent low you are betting on — if that breaks, the bounce thesis is dead. Keep it tight but below the level.
 - TARGET is typically a reversion toward the mean (MA20 / middle Bollinger / nearest resistance), not a new high.
 - Be honest in BEAR points about the counter-trend risk. Mean reversion has lower win-rate tolerance, so CONFIDENCE should reflect that these are higher-risk setups.${weightCommon}
-- Weight slightly MORE: RSI divergence, capitulation/selling-climax signal, oversold depth, support reaction, Bollinger-lower position.
-- Weight slightly LESS: MA trend direction (price is expected to be in a downtrend here — that's the premise, not a disqualifier).
-- In this mode, extreme FEAR on the index leans contrarian-bullish (opportunity) — give it positive weight, while still respecting the falling-knife rule.`;
+- OVERRIDE — market & sector weakness: In this mode, a weak overall market (SPY/QQQ downtrend) and a weak sector are NOT confidence cuts. They are the EXPECTED BACKGROUND for an oversold bounce — reinterpret them as "this is why the stock is cheap," not as a reason to avoid the trade. Do NOT cut confidence merely because the market or sector is down.
+- The ONLY market-related thing that still cuts confidence here is an actively ACCELERATING crash with no stabilization (price still making fresh lows on rising volume with no reclaim) — that is the falling-knife case. A market that is down but stabilizing/basing is FINE for a reversion entry.
+- Lean (only mildly) toward: RSI divergence, capitulation/selling-climax signal, oversold depth, support reaction, Bollinger-lower position — these define the bounce thesis, but keep the tilt gentle per the flat weighting philosophy.
+- De-emphasize (only mildly): MA trend direction (price is expected to be in a downtrend here — that's the premise, not a disqualifier).
+- Extreme FEAR on the index leans contrarian-bullish (opportunity) — give it positive weight, while still respecting the falling-knife rule.`;
   } else if (mode === "balanced") {
     modeMsg = `
 
@@ -587,8 +590,8 @@ Consider BOTH trend-continuation and oversold-bounce setups. If the stock is tre
     modeMsg = `
 
 STRATEGY MODE — TREND FOLLOWING (default):${weightCommon}
-- Weight slightly MORE: trend (MA20/MA50 alignment), weekly-timeframe trend, MACD momentum, buying-pressure (accumulation).
-- Weight slightly LESS: RSI being "overbought" — in a healthy uptrend an overbought RSI can persist and is NOT by itself a sell signal. Note it as a caution, don't let it override a clean trend.
+- Lean (only mildly) toward: trend (MA20/MA50 alignment), weekly-timeframe trend, MACD momentum, buying-pressure (accumulation) — keep the tilt gentle per the flat weighting philosophy.
+- De-emphasize (only mildly): RSI being "overbought" — in a healthy uptrend an overbought RSI can persist and is NOT by itself a sell signal. Note it as a caution, don't let it override a clean trend.
 - All tilts are mild; a strong conflicting signal (e.g. bearish RSI divergence at resistance) should still meaningfully cut confidence.`;
   }
 
@@ -1406,4 +1409,3 @@ export default function App() {
     </div>
   );
 }
-
