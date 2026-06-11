@@ -1,0 +1,41 @@
+name: Stock Screener (Server)
+
+on:
+  workflow_dispatch:
+    inputs:
+      holdings:
+        description: "보유 종목 티커 (쉼표 구분, 예: AAPL,NVDA)"
+        required: false
+        default: ""
+      seed:
+        description: "랜덤 시드 (비우면 자동)"
+        required: false
+        default: ""
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run screener
+        env:
+          TD_API_KEY: ${{ secrets.TD_API_KEY }}
+          HOLDINGS: ${{ inputs.holdings }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          CMD="node screener/screener.js --apikey $TD_API_KEY"
+          [ -n "$HOLDINGS" ] && CMD="$CMD --holdings $HOLDINGS"
+          [ -n "$SEED"     ] && CMD="$CMD --seed $SEED"
+          eval $CMD
+
+      - name: Upload results to Gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: node screener/pushToGist.js

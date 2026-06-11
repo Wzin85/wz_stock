@@ -699,6 +699,7 @@ export default function App() {
   // ── 스크리너 상태 ─────────────────────────────────────────────
   const [showScreener, setShowScreener] = useState(false);
   const [scanStatus, setScanStatus] = useState("idle"); // idle | running | done
+  const [scanMode, setScanMode] = useState("local"); // local | server
   const [scanProgress, setScanProgress] = useState({ cur: 0, total: 0, sym: "", batch: 0, totalBatches: 0, waitSec: 0 });
   const [scanResults, setScanResults] = useState(() => {
     try { return JSON.parse(localStorage.getItem("wz_scanResults") || "[]"); } catch { return []; }
@@ -706,6 +707,7 @@ export default function App() {
   const [scanSeed, setScanSeed] = useState(() => localStorage.getItem("wz_scanSeed") || null);
   const [scanDate, setScanDate] = useState(() => localStorage.getItem("wz_scanDate") || null);
   const scanAbortRef = useRef(false);
+  const pollRef = useRef(null);
 
   useEffect(() => {
     stateRef.current = { positions, accountSize, riskPct, history };
@@ -874,12 +876,84 @@ export default function App() {
     } catch {}
   };
 
+  const stopGistPoll = () => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  };
+
+  const startGistPoll = (triggerDate) => {
+    stopGistPoll();
+    const startedAt = Date.now();
+    const TIMEOUT_MS = 45 * 60 * 1000;
+
+    pollRef.current = setInterval(async () => {
+      if (Date.now() - startedAt > TIMEOUT_MS) {
+        stopGistPoll();
+        setScanStatus("idle");
+        setError("서버 스캔 타임아웃 (45분). GitHub Actions 탭에서 실행 상태를 확인해주세요.");
+        return;
+      }
+      const { token, id } = gistRef.current;
+      if (!token || !id) return;
+      try {
+        const data = await ghReq("GET", `/gists/${id}`, token);
+        const raw = data.files?.["wz_screener.json"]?.content;
+        if (!raw) return;
+        const screenerData = JSON.parse(raw);
+        if (screenerData.date === triggerDate) {
+          const candidates = screenerData.candidates || [];
+          setScanResults(candidates);
+          setScanDate(screenerData.date);
+          setScanSeed(String(screenerData.seed || ""));
+          setScanStatus("done");
+          setScanMode("local");
+          stopGistPoll();
+          try {
+            localStorage.setItem("wz_scanResults", JSON.stringify(candidates));
+            localStorage.setItem("wz_scanDate", screenerData.date);
+          } catch {}
+        }
+      } catch {}
+    }, 30_000);
+  };
+
+  const triggerServerScan = async () => {
+    const { token } = gistRef.current;
+    if (!token) { setError("GitHub Gist를 먼저 연결해주세요"); return; }
+    setScanMode("server");
+    setScanStatus("running");
+    setScanResults([]);
+    setError(null);
+
+    const holdings = positions.map(p => p.ticker).join(",");
+    const today = new Date().toISOString().slice(0, 10);
+
+    try {
+      const r = await fetch("https://api.github.com/repos/Wzin85/wz_stock/actions/workflows/screener.yml/dispatches", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "Content-Type": "application/json" },
+        body: JSON.stringify({ ref: "main", inputs: { holdings } }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.message || `HTTP ${r.status} — 토큰에 repo 권한이 필요해요`);
+      }
+    } catch (e) {
+      setScanStatus("idle");
+      setScanMode("local");
+      setError(`서버 스캔 실패: ${e.message}`);
+      return;
+    }
+
+    startGistPoll(today);
+  };
+
   const updatePositionLevels = (ticker, newStop, newTarget) => {
     savePositions(positions.map(p =>
       p.ticker === ticker ? { ...p, stop: newStop, target: newTarget } : p
     ));
   };
 
+  useEffect(() => () => stopGistPoll(), []);
   useEffect(() => { try { localStorage.setItem("wz_tdKey", tdKey); } catch {} }, [tdKey]);
   useEffect(() => { try { localStorage.setItem("wz_anthropicKey", anthropicKey); } catch {} }, [anthropicKey]);
   useEffect(() => { try { localStorage.setItem("wz_watchlist", input); } catch {} }, [input]);
@@ -1205,12 +1279,21 @@ export default function App() {
                     <span style={{ color: "#334d66" }}>마지막 스캔: {scanDate} · {scanResults.length}종목 발굴됨</span>
                   )}
                 </div>
-                <button style={{ ...s.btn, flex: "none", width: "100%", background: "#00e5a0", color: "#070d18", border: "1px solid #00e5a0" }}
-                  onClick={runScreener}>
-                  스캔 시작
-                </button>
+                <div style={{ display: "flex", gap: "8px", marginBottom: "8px" }}>
+                  <button style={{ ...s.btn, flex: 1, background: "#00e5a0", color: "#070d18", border: "1px solid #00e5a0", lineHeight: "1.5" }}
+                    onClick={() => { setScanMode("local"); runScreener(); }}>
+                    브라우저 스캔<br /><span style={{ fontSize: "9px", opacity: 0.7 }}>탭 열어두기 ~20분</span>
+                  </button>
+                  <button style={{ ...s.btn, flex: 1, background: gistStatus === "ok" ? "#1a2a4a" : "#0b1522", color: gistStatus === "ok" ? "#7eb8f7" : "#334d66", border: `1px solid ${gistStatus === "ok" ? "#7eb8f744" : "#182434"}`, lineHeight: "1.5", cursor: gistStatus === "ok" ? "pointer" : "not-allowed" }}
+                    onClick={triggerServerScan} disabled={gistStatus !== "ok"}>
+                    서버 스캔<br /><span style={{ fontSize: "9px", opacity: 0.7 }}>폰 꺼도 됨 · GitHub Actions</span>
+                  </button>
+                </div>
+                {gistStatus !== "ok" && (
+                  <div style={{ fontSize: "9px", color: "#334d66", marginBottom: "8px" }}>서버 스캔: Gist 연결 + 토큰에 repo 권한 필요</div>
+                )}
                 {scanResults.length > 0 && (
-                  <button style={{ ...s.btn2, width: "100%", marginTop: "8px", color: "#607d9f" }}
+                  <button style={{ ...s.btn2, width: "100%", color: "#607d9f" }}
                     onClick={() => setScanStatus("done")}>
                     지난 결과 보기 ({scanResults.length}종목)
                   </button>
@@ -1219,7 +1302,22 @@ export default function App() {
             )}
 
             {/* RUNNING: 스캔 진행 중 */}
-            {scanStatus === "running" && (
+            {scanStatus === "running" && scanMode === "server" && (
+              <div style={{ textAlign: "center", padding: "16px 0" }}>
+                <div style={{ fontSize: "13px", color: "#7eb8f7", marginBottom: "10px", fontWeight: "700" }}>GitHub Actions 서버에서 실행 중...</div>
+                <div style={{ fontSize: "11px", color: "#607d9f", lineHeight: "1.8", marginBottom: "16px" }}>
+                  폰을 꺼도 됩니다<br />
+                  완료되면 자동으로 결과가 나타납니다<br />
+                  <span style={{ fontSize: "9px", color: "#334d66" }}>30초마다 Gist 확인 중</span>
+                </div>
+                <button style={{ ...s.btn2, color: "#ff4757", borderColor: "#ff475733" }}
+                  onClick={() => { stopGistPoll(); setScanStatus("idle"); setScanMode("local"); }}>
+                  취소
+                </button>
+              </div>
+            )}
+
+            {scanStatus === "running" && scanMode === "local" && (
               <div>
                 <div style={{ height: "2px", background: "#182434", borderRadius: "1px", overflow: "hidden", marginBottom: "12px" }}>
                   <div style={{ height: "100%", width: `${scanProgress.total > 0 ? (scanProgress.cur / scanProgress.total) * 100 : 0}%`, background: "#00e5a0", transition: "width 0.4s ease" }} />
