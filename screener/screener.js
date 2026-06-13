@@ -9,7 +9,11 @@
 
 import { buildUniverse, getSP500Count } from "./universe.js";
 import { fetchRaw, computeIndicators } from "./indicators.js";
-import { MODES, evalMode } from "./filters.js";
+import {
+  evaluateScreenerSnapshot,
+  getSpyMarketRegime,
+  sortModeACandidates,
+} from "../src/screenerRules.js";
 import { API_PLAN, SCREENER_CONFIG } from "./config.js";
 import { getCached, setCached, countCached } from "./cache.js";
 import fs from "node:fs/promises";
@@ -128,9 +132,10 @@ async function processTicker(sym, apiKey, date, forceRefresh) {
 // ── 메인 스크리닝 루프 ────────────────────────────────────────
 async function runScreener(universe, apiKey, date, forceRefresh) {
   const { tickers, sources, effectiveSeed, stats } = universe;
-  const minPass  = SCREENER_CONFIG.minPassCount;
-  const batches  = chunk(tickers, API_PLAN.batchSize);
+  const scanTickers = ["SPY", ...tickers.filter(ticker => ticker !== "SPY")];
+  const batches  = chunk(scanTickers, API_PLAN.batchSize);
   const candidates = [];
+  let marketRegime = { allowModeA: false, trend: "bear", close: null, ma200: null, gapPct: null, reason: "SPY 미처리" };
   let apiCalls = 0, cacheHits = 0, errors = 0;
   const startTime = Date.now();
   const alreadyCached = await countCached(date);
@@ -159,27 +164,29 @@ async function runScreener(universe, apiKey, date, forceRefresh) {
   for (let bi = 0; bi < batches.length; bi++) {
     const batch = batches[bi];
     const batchStart = Date.now();
-    const srcTags = batch.map(t => sources[t] === "fixed" ? `[고정]${t}` : t).join(" ");
+    const srcTags = batch.map(t => t === "SPY" ? "[시장]SPY" : sources[t] === "random" ? t : `[고정]${t}`).join(" ");
     process.stdout.write(`  [배치 ${bi + 1}/${batches.length}]  ${srcTags}\n`);
 
     for (let si = 0; si < batch.length; si++) {
       const sym = batch[si];
       const total = bi * API_PLAN.batchSize + si + 1;
       process.stdout.write(
-        `\r  진행 ${String(total).padStart(3)}/${tickers.length}  [${sym.padEnd(5)}]  API: ${apiCalls}  캐시: ${cacheHits}  통과: ${candidates.length}`
+        `\r  진행 ${String(total).padStart(3)}/${scanTickers.length}  [${sym.padEnd(5)}]  API: ${apiCalls}  캐시: ${cacheHits}  통과: ${candidates.length}`
       );
 
       try {
         const { indicators: ind, fromCache } = await processTicker(sym, apiKey, date, forceRefresh);
         fromCache ? cacheHits++ : apiCalls++;
 
-        const modeResults = {};
-        for (const mode of MODES) {
-          const res = evalMode(ind, mode, minPass);
-          if (res) modeResults[mode.id] = { ...res, name: mode.name };
+        if (sym === "SPY") {
+          marketRegime = getSpyMarketRegime(ind);
+          clearLine();
+          console.log(`  시장 필터: ${marketRegime.reason}${marketRegime.gapPct != null ? ` (${marketRegime.gapPct >= 0 ? "+" : ""}${marketRegime.gapPct.toFixed(1)}%)` : ""}`);
+          continue;
         }
 
-        if (Object.keys(modeResults).length > 0) {
+        const modeResults = evaluateScreenerSnapshot(ind, { allowModeA: marketRegime.allowModeA });
+        if (modeResults) {
           const candidate = buildCandidate(sym, ind, modeResults, sources[sym]);
           candidates.push(candidate);
           clearLine();
@@ -207,18 +214,27 @@ async function runScreener(universe, apiKey, date, forceRefresh) {
   const elapsed = Math.round((Date.now() - startTime) / 1000);
   clearLine();
   console.log(`\n${"─".repeat(72)}`);
-  console.log(`  완료: ${tickers.length}종목 · API ${apiCalls}콜 · 캐시 ${cacheHits}회 · 오류 ${errors}개 · ${elapsed}초`);
+  console.log(`  완료: ${tickers.length}종목 + SPY · API ${apiCalls}콜 · 캐시 ${cacheHits}회 · 오류 ${errors}개 · ${elapsed}초`);
   console.log(`  일별 크레딧 사용: ${apiCalls} / ${API_PLAN.creditsPerDay}`);
   console.log(`${"═".repeat(72)}\n`);
 
-  return candidates;
+  const rankedA = sortModeACandidates(candidates.filter(candidate => candidate.modeDetails.A));
+  const aRank = new Map(rankedA.map((candidate, index) => [candidate.ticker, index]));
+  const sortedCandidates = [...candidates].sort((a, b) => {
+    const aHasA = aRank.has(a.ticker);
+    const bHasA = aRank.has(b.ticker);
+    if (aHasA && bHasA) return aRank.get(a.ticker) - aRank.get(b.ticker);
+    if (aHasA !== bHasA) return aHasA ? -1 : 1;
+    return a.ticker.localeCompare(b.ticker);
+  }).map(candidate => ({ ...candidate, marketRegime }));
+  return { candidates: sortedCandidates, marketRegime };
 }
 
 // ── 후보 객체 ─────────────────────────────────────────────────
 function buildCandidate(sym, ind, modeResults, source) {
   return {
     ticker: sym,
-    source: source || "random",   // "fixed" | "random"
+    source: source || "random",   // "holding" | "watchlist" | "random"
     modes: Object.keys(modeResults),
     modeDetails: modeResults,
     snapshot: {
@@ -231,17 +247,19 @@ function buildCandidate(sym, ind, modeResults, source) {
       ma50:     ind.ma50 ? Math.round(ind.ma50 * 100) / 100 : null,
       atrPct:   Math.round(ind.atrPct * 10) / 10,
       bbPos:    Math.round(ind.bbPos * 100) / 100,
+      mfRatio:  Math.round(ind.mfRatio * 1000) / 1000,
+      ma20GapPct: Math.round(ind.ma20GapPct * 100) / 100,
     },
   };
 }
 
 // ── 실시간 매치 출력 ──────────────────────────────────────────
 function printMatch(c, fromCache) {
-  const srcTag  = c.source === "fixed" ? "[고정]" : "[랜덤]";
+  const srcTag  = c.source === "holding" ? "[보유]" : c.source === "watchlist" ? "[관심]" : "[랜덤]";
   const cacheTag = fromCache ? "[캐시]" : "[API] ";
   const modes = c.modes.map(id => {
     const d = c.modeDetails[id];
-    return `모드${id}(${d.count}/${d.detail.length}) ${d.name}`;
+    return `모드${id}(${d.count}/${d.total}) ${d.name}`;
   }).join(" + ");
   const tags = [...new Set(c.modes.flatMap(id => c.modeDetails[id].tags))];
   const s = c.snapshot;
@@ -255,7 +273,7 @@ function printSummaryTable(candidates) {
 
   const sorted = [...candidates].sort((a, b) => {
     // 고정 종목 우선, 그 다음 둘 다 통과, A만, B만
-    if (a.source !== b.source) return a.source === "fixed" ? -1 : 1;
+    if (a.source !== b.source) return a.source !== "random" ? -1 : 1;
     const rank = x => x.modes.length === 2 ? 0 : x.modes.includes("A") ? 1 : 2;
     if (rank(a) !== rank(b)) return rank(a) - rank(b);
     const maxCount = x => Math.max(...x.modes.map(id => x.modeDetails[id].count));
@@ -270,8 +288,8 @@ function printSummaryTable(candidates) {
 
   for (const c of sorted) {
     const s = c.snapshot;
-    const srcLabel = c.source === "fixed" ? "[고정]" : "[랜덤]";
-    const mStr = c.modes.map(id => `${id}:${c.modeDetails[id].count}/${c.modeDetails[id].detail.length}`).join("+").padEnd(9);
+    const srcLabel = c.source === "holding" ? "[보유]" : c.source === "watchlist" ? "[관심]" : "[랜덤]";
+    const mStr = c.modes.map(id => `${id}:${c.modeDetails[id].count}/${c.modeDetails[id].total}`).join("+").padEnd(9);
     const tags = [...new Set(c.modes.flatMap(id => c.modeDetails[id].tags))].join(", ");
     console.log(
       `  ${c.ticker.padEnd(5)} ${srcLabel}  ${mStr} ` +
@@ -287,14 +305,14 @@ function printSummaryTable(candidates) {
   const mA   = candidates.filter(c => c.modes.includes("A")).length;
   const mB   = candidates.filter(c => c.modes.includes("B")).length;
   const both = candidates.filter(c => c.modes.length === 2).length;
-  const fixedPass = candidates.filter(c => c.source === "fixed").length;
+  const fixedPass = candidates.filter(c => c.source !== "random").length;
   const randPass  = candidates.filter(c => c.source === "random").length;
   console.log(`  모드A(추세추종): ${mA}  모드B(역추세반등): ${mB}  둘다: ${both}`);
   console.log(`  고정 통과: ${fixedPass}  랜덤 통과: ${randPass}  합계: ${candidates.length}\n`);
 }
 
 // ── saveResults ───────────────────────────────────────────────
-async function saveResults(candidates, universe, date) {
+async function saveResults(candidates, universe, date, marketRegime) {
   const dir = path.join(__dirname, "results");
   await fs.mkdir(dir, { recursive: true });
 
@@ -309,12 +327,15 @@ async function saveResults(candidates, universe, date) {
       both: candidates.filter(c => c.modes.length === 2).length,
     },
     source_counts: {
-      fixed:  candidates.filter(c => c.source === "fixed").length,
+      fixed:  candidates.filter(c => c.source !== "random").length,
+      watchlist: candidates.filter(c => c.source === "watchlist").length,
+      holdings: candidates.filter(c => c.source === "holding").length,
       random: candidates.filter(c => c.source === "random").length,
     },
     // Claude 판단 로직에 그대로 넘길 수 있는 티커 목록
     tickers: candidates.map(c => c.ticker),
     candidates,
+    marketRegime,
   };
 
   const filepath = path.join(dir, `${date}.json`);
@@ -335,10 +356,10 @@ async function main() {
   const maxSize = limit ?? SCREENER_CONFIG.universeMaxSize;
   const universe = buildUniverse(watchlist, holdings, maxSize, seed);
 
-  const candidates = await runScreener(universe, apiKey, date, forceRefresh);
+  const { candidates, marketRegime } = await runScreener(universe, apiKey, date, forceRefresh);
   printSummaryTable(candidates);
 
-  const filepath = await saveResults(candidates, universe, date);
+  const filepath = await saveResults(candidates, universe, date, marketRegime);
   console.log(`  저장: ${filepath}`);
   console.log(`  티커: ${candidates.map(c => c.ticker).join(", ") || "없음"}\n`);
 }

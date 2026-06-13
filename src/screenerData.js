@@ -1,6 +1,8 @@
 // ── 브라우저 스크리너용 데이터 + 유틸 ─────────────────────────
 // computeIndicators 결과(App.jsx)를 그대로 사용
 
+import { evaluateScreenerSnapshot } from "./screenerRules";
+
 // ── S&P 500 풀 (~490종목, API 호출 없음) ─────────────────────
 export const SP500_POOL = [
   "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A",
@@ -100,62 +102,19 @@ export function buildScreenerUniverse(fixed, maxSize = 150, seed = null) {
   };
 }
 
-// ── 스크리너 모드 조건 ────────────────────────────────────────
-// ind: App.jsx의 computeIndicators() 반환값
-export const SCREENER_MODES = [
-  {
-    id: "A", name: "추세추종",
-    conditions: [
-      { label: "정배열",    fn: ind => ind.raw.ma20 != null && ind.raw.ma50 != null && ind.raw.ma20 > ind.raw.ma50 },
-      { label: "MA20위",   fn: ind => ind.current_price > ind.raw.ma20 },
-      { label: "52w중간위", fn: ind => ind.indicators.pos52w.pos >= 0.5 },
-      { label: "수급유입",  fn: ind => ind.raw.volRatio >= 1.3 },
-      { label: "RSI모멘텀", fn: ind => ind.indicators.rsi.value >= 50 && ind.indicators.rsi.value <= 70 },
-    ],
-  },
-  {
-    id: "B", name: "역추세반등",
-    conditions: [
-      { label: "RSI과매도",  fn: ind => ind.indicators.rsi.value <= 35 },
-      { label: "BB하단근접", fn: ind => {
-        const bb = ind.raw.bb;
-        return (bb.upper - bb.lower) > 0
-          ? (ind.current_price - bb.lower) / (bb.upper - bb.lower) < 0.2
-          : false;
-      }},
-      { label: "눌림구간",   fn: ind => ind.indicators.pos52w.fromH >= -25 && ind.indicators.pos52w.fromH <= -8 },
-      { label: "반등거래량", fn: ind => ind.raw.volRatio >= 1.5 },
-      { label: "MA50근접위", fn: ind => ind.raw.ma50 != null && ind.current_price >= ind.raw.ma50 * 0.97 },
-    ],
-  },
-];
-
-export const SCREENER_MIN_PASS = 4;
-
 // 모드 평가 → 통과한 모드들의 결과 객체 반환 (없으면 null)
 // Mode B 통과 시 RSI 다이버전스/셀링 클라이맥스 보너스 감지 포함
-export function evalScreenerModes(ind) {
-  const results = {};
-  for (const mode of SCREENER_MODES) {
-    const conds = mode.conditions.map(c => ({ label: c.label, passed: c.fn(ind) }));
-    const count = conds.filter(r => r.passed).length;
-    if (count >= SCREENER_MIN_PASS) {
-      results[mode.id] = {
-        name: mode.name,
-        count,
-        total: mode.conditions.length,
-        tags: conds.filter(r => r.passed).map(r => r.label),
-      };
-    }
-  }
+export function evalScreenerModes(snapshot, advancedIndicators = null, options = {}) {
+  const results = evaluateScreenerSnapshot(snapshot, options);
+  if (!results) return null;
 
   // Mode B 보너스: 고급 반등 신호 감지 (필수 아님, 표시용)
   if (results.B) {
     const bonus = [];
-    if (ind.indicators?.rsiDiv?.type === "bullish") bonus.push("RSI다이버전스");
-    if (ind.indicators?.capitulation?.signal === "capitulation") bonus.push("셀링클라이맥스");
+    if (advancedIndicators?.rsiDiv?.type === "bullish") bonus.push("RSI다이버전스");
+    if (advancedIndicators?.capitulation?.signal === "capitulation") bonus.push("셀링클라이맥스");
     if (bonus.length > 0) results.B.bonus = bonus;
   }
 
-  return Object.keys(results).length > 0 ? results : null;
+  return results;
 }

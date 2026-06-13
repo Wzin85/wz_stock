@@ -3,3 +3,7 @@ dist
 .DS_Store
 screener/results/
 screener/cache/
+backtest/cache/
+backtest/results/
+backtest/__pycache__/
+backtest/log.txt

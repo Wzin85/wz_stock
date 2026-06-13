@@ -1,5 +1,46 @@
 import { useState, useEffect, useRef } from "react";
 import { buildScreenerUniverse, evalScreenerModes } from "./screenerData";
+import {
+  computeScreenerSnapshot,
+  getSpyMarketRegime,
+  sortModeACandidates,
+} from "./screenerRules";
+
+const GLOSSARY = [
+  { term: "RSI", full: "상대강도지수", desc: "0~100 사이 값. 70 이상이면 과매수(너무 올랐다), 30 이하면 과매도(너무 빠졌다) 신호. 모멘텀을 봄." },
+  { term: "MACD", full: "이동평균수렴확산", desc: "단기·장기 이평선의 차이로 추세 전환을 포착. 골든크로스(상향 교차)는 강세, 데드크로스는 약세 신호." },
+  { term: "볼린저밴드", full: "Bollinger Bands", desc: "가격의 평균선 위아래로 변동성 띠를 그림. 하단 터치는 과매도, 상단 터치는 과매수. 밴드가 좁아지면 큰 움직임 예고." },
+  { term: "MA20 / MA50", full: "이동평균선", desc: "최근 20일·50일 평균 가격. MA20>MA50이면 정배열(상승 구조). 가격이 이평선 위에 있으면 추세가 살아있음." },
+  { term: "VWAP", full: "거래량가중평균가격", desc: "거래량을 반영한 평균 가격. 가격이 VWAP 위면 매수세 우위, 아래면 매도세 우위로 해석." },
+  { term: "ATR", full: "평균실제변동폭", desc: "하루에 보통 얼마나 움직이는지(변동성). ATR이 크면 변동성 큰 종목 → 손절을 넓게 잡아야 안 털림." },
+  { term: "CLV / 꼬리 분석", full: "Close Location Value", desc: "종가가 그날 고가·저가 중 어디서 마감했는지. 고가 근처 마감(아래꼬리)은 매수세, 저가 근처(윗꼬리)는 매도세." },
+  { term: "지지선 / 저항선", full: "Support / Resistance", desc: "가격이 잘 안 깨지는 바닥(지지)과 천장(저항). 손절은 지지선 아래, 목표는 저항선 근처로 잡음." },
+  { term: "손익비 (R/R)", full: "Risk/Reward Ratio", desc: "먹을 것 ÷ 잃을 것. 2:1이면 잃는 1 대비 2를 노림. 스윙은 보통 2 이상을 권장." },
+  { term: "RSI 다이버전스", full: "Divergence", desc: "가격은 신저점인데 RSI는 안 떨어짐 = 하락 동력 약해짐(반등 신호). 떨어지는 칼날과 진짜 바닥을 구분." },
+  { term: "셀링 클라이맥스", full: "Selling Climax", desc: "거래량 폭증하며 투매 후 반등 = 팔 사람 다 팔린 바닥 신호. 역추세 진입의 단서." },
+  { term: "트레일링 스탑", full: "Trailing Stop", desc: "가격이 오르면 손절가도 따라 올리는 것. 이익을 보호하면서 추세를 더 따라감. (손절은 올리기만, 내리지 않음)" },
+  { term: "공포탐욕지수", full: "Fear & Greed Index", desc: "0~100. 시장 심리 측정. 극단적 공포(25↓)는 역발상 매수 기회일 수 있고, 극단적 탐욕(75↑)은 과열 경계." },
+  { term: "추세추종 (Mode A)", full: "Trend Following", desc: "오르는 추세에 올라타는 전략. 정배열·모멘텀 살아있는 강한 종목을 노림." },
+  { term: "역추세 반등 (Mode B)", full: "Mean Reversion", desc: "과매도 후 반등을 노리는 전략. 많이 빠졌다가 바닥 다지고 돌아서는 종목을 노림." },
+  { term: "포지션 사이징", full: "Position Sizing", desc: "한 거래에 얼마를 걸지. 보통 전체 자금의 2%만 잃도록 수량을 정함 (2% 룰)." },
+  { term: "MDD", full: "최대낙폭", desc: "고점 대비 최대로 떨어진 비율. 전략이 최악일 때 얼마나 깨지는지. 작을수록 안정적." },
+  { term: "갭 (Gap)", full: "Gap", desc: "전날 종가와 다음날 시가 사이의 빈 구간. 실적·뉴스로 장외에서 가격이 뛰면 발생. 스윙의 최대 리스크." },
+];
+
+const ANALYSIS_MODES = [
+  { id: "trend", label: "추세추종" },
+  { id: "reversion", label: "역추세반등" },
+  { id: "balanced", label: "균형" },
+];
+
+const sourceToMode = source => source === "A" ? "trend" : source === "B" ? "reversion" : "balanced";
+
+const normalizePosition = position => ({
+  ...position,
+  shares: Number.isFinite(Number(position.shares)) ? Number(position.shares) : 0,
+  currentPrice: Number.isFinite(Number(position.currentPrice)) ? Number(position.currentPrice) : null,
+  priceDate: position.priceDate || null,
+});
 
 const INTERPRET_PROMPT = `You are a seasoned swing trading STRATEGIST (not a checklist analyst). You receive PRE-CALCULATED indicators from REAL daily price data — trust these numbers, never recalculate. Your job is not to "score" indicators but to think like a risk manager: weave the signals into a coherent picture, decide how to protect capital first and capture upside second, and form a concrete plan. Holding horizon: days to a few weeks.
 
@@ -621,7 +662,7 @@ STRATEGY MODE — TREND FOLLOWING (default):${weightCommon}
     const sc = typeof sectors[secEtf] === "object" ? sectors[secEtf].score : sectors[secEtf];
     if (sc != null) sectorInfo = { score: sc, name: SECTOR_KR[secEtf] || secEtf };
   }
-  return { ticker: sym, ...ind, ...interp, earnings, sector: sectorInfo, weekly };
+  return { ticker: sym, ...ind, ...interp, earnings, sector: sectorInfo, weekly, analysisMode: mode };
 }
 
 // ── GitHub Gist 동기화 ────────────────────────────────
@@ -646,7 +687,7 @@ async function findOrCreateGist(token) {
   const list = await ghReq("GET", "/gists?per_page=100", token);
   const found = list.find(g => g.description === GIST_DESC && g.files?.[GIST_FILE]);
   if (found) { localStorage.setItem("wz_gistId", found.id); return found.id; }
-  const blank = { positions: [], settings: { accountSize: null, riskPct: 1 }, history: [] };
+  const blank = { positions: [], settings: { riskPct: 1, cash: 0 }, history: [] };
   const created = await ghReq("POST", "/gists", token, {
     description: GIST_DESC, public: false,
     files: { [GIST_FILE]: { content: JSON.stringify(blank) } },
@@ -684,26 +725,29 @@ export default function App() {
   const [market, setMarket] = useState(null);
   const [sectors, setSectors] = useState(null);
   const [positions, setPositions] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("wz_positions") || "[]"); }
+    try { return JSON.parse(localStorage.getItem("wz_positions") || "[]").map(normalizePosition); }
     catch { return []; }
   });
-  const [showPos, setShowPos] = useState(false);
-  const [strategyMode, setStrategyMode] = useState(() => { try { return localStorage.getItem("wz_strategyMode") || "trend"; } catch { return "trend"; } });
-  const [newPos, setNewPos] = useState({ ticker: "", entry: "", target: "", stop: "" });
+  const [activeTab, setActiveTab] = useState("analyze");
+  const [analysisSources, setAnalysisSources] = useState({});
+  const [newPos, setNewPos] = useState({ ticker: "", entry: "", target: "", stop: "", shares: "" });
   const [editingPos, setEditingPos] = useState(null); // ticker being edited
-  const [editVals, setEditVals] = useState({ entry: "", target: "", stop: "" });
+  const [editVals, setEditVals] = useState({ entry: "", target: "", stop: "", shares: "" });
 
   const [gistToken, setGistToken] = useState(() => localStorage.getItem("wz_gistToken") || "");
   const [gistStatus, setGistStatus] = useState("idle"); // idle | connecting | ok | err
-  const [accountSize, setAccountSize] = useState(null);
   const [riskPct, setRiskPct] = useState(1);
+  const [cash, setCash] = useState(() => {
+    try {
+      const saved = parseFloat(localStorage.getItem("wz_cash"));
+      return Number.isFinite(saved) ? saved : 0;
+    } catch { return 0; }
+  });
   const [history, setHistory] = useState([]);
-  const [showHistory, setShowHistory] = useState(false);
   const gistRef = useRef({ token: "", id: "" });
-  const stateRef = useRef({ positions: [], accountSize: null, riskPct: 1, history: [] });
+  const stateRef = useRef({ positions: [], riskPct: 1, cash: 0, history: [] });
 
   // ── 스크리너 상태 ─────────────────────────────────────────────
-  const [showScreener, setShowScreener] = useState(false);
   const [scanStatus, setScanStatus] = useState("idle"); // idle | running | done
   const [scanMode, setScanMode] = useState("local"); // local | server
   const [scanProgress, setScanProgress] = useState({ cur: 0, total: 0, sym: "", batch: 0, totalBatches: 0, waitSec: 0 });
@@ -712,12 +756,14 @@ export default function App() {
   });
   const [scanSeed, setScanSeed] = useState(() => localStorage.getItem("wz_scanSeed") || null);
   const [scanDate, setScanDate] = useState(() => localStorage.getItem("wz_scanDate") || null);
+  const [scanResultTab, setScanResultTab] = useState("A");
+  const [scanMarketRegime, setScanMarketRegime] = useState(null);
   const scanAbortRef = useRef(false);
   const pollRef = useRef(null);
 
   useEffect(() => {
-    stateRef.current = { positions, accountSize, riskPct, history };
-  }, [positions, accountSize, riskPct, history]);
+    stateRef.current = { positions, riskPct, cash, history };
+  }, [positions, riskPct, cash, history]);
 
   const syncToGist = async (patch) => {
     const { token, id } = gistRef.current;
@@ -725,7 +771,10 @@ export default function App() {
     const s = stateRef.current;
     const payload = {
       positions: patch?.positions ?? s.positions,
-      settings: { accountSize: patch?.accountSize ?? s.accountSize, riskPct: patch?.riskPct ?? s.riskPct },
+      settings: {
+        riskPct: patch?.riskPct ?? s.riskPct,
+        cash: patch?.cash ?? s.cash,
+      },
       history: patch?.history ?? s.history,
     };
     try { await pushGist(token, id, payload); } catch (e) { console.warn("Gist sync:", e.message); }
@@ -742,18 +791,29 @@ export default function App() {
       if (main) {
         const localPos = stateRef.current.positions;
         if (main.positions?.length) {
-          setPositions(main.positions);
+          const normalized = main.positions.map(normalizePosition);
+          setPositions(normalized);
+          try { localStorage.setItem("wz_positions", JSON.stringify(normalized)); } catch {}
         } else if (localPos.length) {
-          await pushGist(t, id, { positions: localPos, settings: { accountSize: null, riskPct: 1 }, history: [] });
+          await pushGist(t, id, {
+            positions: localPos,
+            settings: { riskPct: stateRef.current.riskPct, cash: stateRef.current.cash },
+            history: stateRef.current.history,
+          });
         }
-        if (main.settings?.accountSize != null) setAccountSize(main.settings.accountSize);
         if (main.settings?.riskPct != null) setRiskPct(main.settings.riskPct);
+        if (main.settings?.cash != null) {
+          const gistCash = Number(main.settings.cash);
+          setCash(Number.isFinite(gistCash) ? gistCash : 0);
+          try { localStorage.setItem("wz_cash", String(Number.isFinite(gistCash) ? gistCash : 0)); } catch {}
+        }
         if (main.history?.length) setHistory(main.history);
       }
       if (screener?.candidates?.length) {
         setScanResults(screener.candidates);
         setScanDate(screener.date || null);
         setScanSeed(screener.seed ? String(screener.seed) : null);
+        setScanMarketRegime(screener.marketRegime || screener.candidates[0]?.marketRegime || null);
         setScanStatus("done");
         try {
           localStorage.setItem("wz_scanResults", JSON.stringify(screener.candidates));
@@ -774,32 +834,51 @@ export default function App() {
   }, []);
 
   const savePositions = (next) => {
-    setPositions(next);
-    try { localStorage.setItem("wz_positions", JSON.stringify(next)); } catch {}
-    syncToGist({ positions: next });
+    const normalized = next.map(normalizePosition);
+    stateRef.current = { ...stateRef.current, positions: normalized };
+    setPositions(normalized);
+    try { localStorage.setItem("wz_positions", JSON.stringify(normalized)); } catch {}
+    syncToGist({ positions: normalized });
   };
 
   const addPosition = () => {
     const t = newPos.ticker.trim().toUpperCase();
-    const entry = parseFloat(newPos.entry), stop = parseFloat(newPos.stop), target = parseFloat(newPos.target);
+    const entry = parseFloat(newPos.entry), stop = parseFloat(newPos.stop), target = parseFloat(newPos.target), shares = parseFloat(newPos.shares);
     if (!t || isNaN(entry)) { setError("티커와 진입가를 입력해주세요"); return; }
+    if (!isNaN(shares) && shares < 0) { setError("수량은 0 이상이어야 해요"); return; }
     if (positions.some(p => p.ticker === t)) { setError(`${t}는 이미 보유 목록에 있어요`); return; }
     setError(null);
-    savePositions([...positions, { ticker: t, side: "BUY", entry, stop: isNaN(stop) ? null : stop, target: isNaN(target) ? null : target, date: new Date().toISOString().slice(0, 10) }]);
-    setNewPos({ ticker: "", entry: "", target: "", stop: "" });
+    savePositions([...positions, {
+      ticker: t,
+      side: "BUY",
+      entry,
+      stop: isNaN(stop) ? null : stop,
+      target: isNaN(target) ? null : target,
+      shares: isNaN(shares) ? 0 : shares,
+      currentPrice: null,
+      priceDate: null,
+      date: new Date().toISOString().slice(0, 10),
+    }]);
+    setNewPos({ ticker: "", entry: "", target: "", stop: "", shares: "" });
   };
 
   const startEdit = (p) => {
     setEditingPos(p.ticker);
-    setEditVals({ entry: String(p.entry ?? ""), target: p.target != null ? String(p.target) : "", stop: p.stop != null ? String(p.stop) : "" });
+    setEditVals({
+      entry: String(p.entry ?? ""),
+      target: p.target != null ? String(p.target) : "",
+      stop: p.stop != null ? String(p.stop) : "",
+      shares: String(p.shares ?? 0),
+    });
   };
 
   const saveEdit = (ticker) => {
-    const entry = parseFloat(editVals.entry), target = parseFloat(editVals.target), stop = parseFloat(editVals.stop);
+    const entry = parseFloat(editVals.entry), target = parseFloat(editVals.target), stop = parseFloat(editVals.stop), shares = parseFloat(editVals.shares);
     if (isNaN(entry)) { setError("진입가는 비울 수 없어요"); return; }
+    if (isNaN(shares) || shares < 0) { setError("수량은 0 이상의 숫자로 입력해주세요"); return; }
     setError(null);
     savePositions(positions.map(p => p.ticker === ticker
-      ? { ...p, entry, target: isNaN(target) ? null : target, stop: isNaN(stop) ? null : stop }
+      ? { ...p, entry, target: isNaN(target) ? null : target, stop: isNaN(stop) ? null : stop, shares }
       : p));
     setEditingPos(null);
   };
@@ -813,8 +892,12 @@ export default function App() {
     setScanResults([]);
     setError(null);
 
-    const fixed = positions.map(p => p.ticker);
+    const holdingsSet = new Set(positions.map(p => p.ticker));
+    const watchlist = input.split(/[,\s]+/).map(ticker => ticker.trim().toUpperCase()).filter(Boolean);
+    const watchlistSet = new Set(watchlist.filter(ticker => !holdingsSet.has(ticker)));
+    const fixed = [...holdingsSet, ...watchlistSet];
     const universe = buildScreenerUniverse(fixed, 150);
+    const scanTickers = ["SPY", ...universe.tickers.filter(ticker => ticker !== "SPY")];
     setScanSeed(String(universe.effectiveSeed));
     try { localStorage.setItem("wz_scanSeed", String(universe.effectiveSeed)); } catch {}
 
@@ -822,12 +905,13 @@ export default function App() {
     const BATCH_DELAY_MS = 63_000;
     const INTRA_DELAY_MS = 400;
     const batches = [];
-    for (let i = 0; i < universe.tickers.length; i += BATCH_SIZE) {
-      batches.push(universe.tickers.slice(i, i + BATCH_SIZE));
+    for (let i = 0; i < scanTickers.length; i += BATCH_SIZE) {
+      batches.push(scanTickers.slice(i, i + BATCH_SIZE));
     }
 
     const candidates = [];
     let scanned = 0;
+    let marketRegime = { allowModeA: false, trend: "bear", close: null, ma200: null, gapPct: null, reason: "SPY 미처리" };
 
     outer: for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi];
@@ -836,23 +920,31 @@ export default function App() {
       for (let si = 0; si < batch.length; si++) {
         if (scanAbortRef.current) break outer;
         const sym = batch[si];
-        scanned++;
+        if (sym !== "SPY") scanned++;
         setScanProgress({ cur: scanned, total: universe.tickers.length, sym, batch: bi + 1, totalBatches: batches.length, waitSec: 0 });
 
         try {
           const resp = await fetch(`https://api.twelvedata.com/time_series?symbol=${sym}&interval=1day&outputsize=260&apikey=${tdKey.trim()}`);
           const td = await resp.json();
           if (!td.values || td.status === "error") throw new Error(td.message || "no data");
+          const snapshot = computeScreenerSnapshot(td.values);
+          if (sym === "SPY") {
+            marketRegime = getSpyMarketRegime(snapshot);
+            setScanMarketRegime(marketRegime);
+            continue;
+          }
           const ind = computeIndicators(td.values);
-          const modeResult = evalScreenerModes(ind);
+          const modeResult = evalScreenerModes(snapshot, ind.indicators, { allowModeA: marketRegime.allowModeA });
           if (modeResult) {
             const candidate = {
               ticker: sym,
-              source: universe.sources[sym],
+              source: holdingsSet.has(sym) ? "holding" : watchlistSet.has(sym) ? "watchlist" : "random",
               price: ind.current_price,
               rsi: ind.indicators.rsi.value,
               fromH52: ind.indicators.pos52w.fromH,
               volRatio: Math.round(ind.raw.volRatio * 100) / 100,
+              mfRatio: Math.round(snapshot.mf_ratio * 1000) / 1000,
+              ma20GapPct: Math.round(snapshot.ma20_gap_pct * 100) / 100,
               modes: modeResult,
             };
             candidates.push(candidate);
@@ -882,11 +974,22 @@ export default function App() {
       }
     }
 
+    const rankedA = sortModeACandidates(candidates.filter(candidate => candidate.modes.A));
+    const aRank = new Map(rankedA.map((candidate, index) => [candidate.ticker, index]));
+    const sortedCandidates = [...candidates].sort((a, b) => {
+      const aHasA = aRank.has(a.ticker);
+      const bHasA = aRank.has(b.ticker);
+      if (aHasA && bHasA) return aRank.get(a.ticker) - aRank.get(b.ticker);
+      if (aHasA !== bHasA) return aHasA ? -1 : 1;
+      return a.ticker.localeCompare(b.ticker);
+    }).map(candidate => ({ ...candidate, marketRegime }));
+    setScanResults(sortedCandidates);
+
     const today = new Date().toISOString().slice(0, 10);
     setScanDate(today);
     setScanStatus(scanAbortRef.current ? "idle" : "done");
     try {
-      localStorage.setItem("wz_scanResults", JSON.stringify(candidates));
+      localStorage.setItem("wz_scanResults", JSON.stringify(sortedCandidates));
       localStorage.setItem("wz_scanDate", today);
     } catch {}
   };
@@ -919,6 +1022,7 @@ export default function App() {
           setScanResults(candidates);
           setScanDate(screenerData.date);
           setScanSeed(String(screenerData.seed || ""));
+          setScanMarketRegime(screenerData.marketRegime || candidates[0]?.marketRegime || null);
           setScanStatus("done");
           setScanMode("local");
           stopGistPoll();
@@ -972,8 +1076,11 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem("wz_tdKey", tdKey); } catch {} }, [tdKey]);
   useEffect(() => { try { localStorage.setItem("wz_anthropicKey", anthropicKey); } catch {} }, [anthropicKey]);
   useEffect(() => { try { localStorage.setItem("wz_watchlist", input); } catch {} }, [input]);
-  useEffect(() => { try { localStorage.setItem("wz_strategyMode", strategyMode); } catch {} }, [strategyMode]);
-  useEffect(() => { syncToGist({ accountSize, riskPct }); }, [accountSize, riskPct]);
+  useEffect(() => {
+    try { localStorage.setItem("wz_cash", String(cash)); } catch {}
+    const timer = setTimeout(() => syncToGist({ riskPct, cash }), 500);
+    return () => clearTimeout(timer);
+  }, [riskPct, cash]);
 
   useEffect(() => {
     fetch("https://feargreedchart.com/api/?action=all")
@@ -988,49 +1095,32 @@ export default function App() {
 
   const analyzePositions = () => {
     if (!positions.length) { setError("보유 종목이 없어요. 먼저 추가해주세요"); return; }
-    runAnalysis(positions.map(p => p.ticker));
+    runAnalysis(positions.map(p => ({ ticker: p.ticker, source: "manual" })));
   };
 
-  const runAnalysis = async (symbols) => {
-    if (!tdKey.trim()) { setError("Twelve Data API 키를 입력해주세요"); return; }
-    if (!anthropicKey.trim()) { setError("Anthropic API 키를 입력해주세요"); return; }
-    const syms = [...new Set(symbols.map(s => s.trim().toUpperCase()).filter(Boolean))];
-    if (!syms.length || analyzing) return;
-    setAnalyzing(true); setError(null); setResults([]); setExpanded(null);
+  const sortAnalysisResults = items => [...items].sort((a, b) => {
+    const pa = a.error ? 9 : REC_PRIORITY[a.recommendation] ?? 5;
+    const pb = b.error ? 9 : REC_PRIORITY[b.recommendation] ?? 5;
+    if (pa !== pb) return pa - pb;
+    return (b.confidence || 0) - (a.confidence || 0);
+  });
 
-    const collected = [];
-    for (let i = 0; i < syms.length; i++) {
-      setProgress({ cur: i + 1, total: syms.length, sym: syms[i] });
-      try {
-        const heldPos = positions.find(p => p.ticker === syms[i]) || null;
-        const res = await analyzeOne(syms[i], tdKey.trim(), anthropicKey.trim(), fng, market, sectors, heldPos, strategyMode);
-        const pos = positions.find(p => p.ticker === syms[i]);
-        if (pos) {
-          const pnlPct = ((res.current_price - pos.entry) / pos.entry) * 100;
-          const stopBroken = pos.stop != null && res.current_price <= pos.stop;
-          let status;
-          if (res.recommendation === "BUY") status = { txt: "신호 유효 · 보유 지속", col: "#00e5a0" };
-          else if (stopBroken) status = { txt: "손절가 도달 · 청산 검토", col: "#ff4757" };
-          else if (res.recommendation === "SELL") status = { txt: "신호 약화 · 손절선은 유효 (룰상 보유)", col: "#ffb830" };
-          else status = { txt: "중립 전환 · 손절선 유효", col: "#ffb830" };
-          res.position = { ...pos, pnlPct, stopBroken, status };
-        }
-        collected.push(res);
-      }
-      catch (e) { collected.push({ ticker: syms[i], error: true, errMsg: e.message }); }
-      const sorted = [...collected].sort((a, b) => {
-        const pa = a.error ? 9 : REC_PRIORITY[a.recommendation] ?? 5;
-        const pb = b.error ? 9 : REC_PRIORITY[b.recommendation] ?? 5;
-        if (pa !== pb) return pa - pb;
-        return (b.confidence || 0) - (a.confidence || 0);
-      });
-      setResults(sorted);
-      if (i < syms.length - 1) await new Promise(r => setTimeout(r, 8500));
-    }
+  const attachPositionStatus = (res, ticker) => {
+    const pos = positions.find(p => p.ticker === ticker);
+    if (!pos) return res;
+    const pnlPct = ((res.current_price - pos.entry) / pos.entry) * 100;
+    const stopBroken = pos.stop != null && res.current_price <= pos.stop;
+    let status;
+    if (res.recommendation === "BUY") status = { txt: "신호 유효 · 보유 지속", col: "#00e5a0" };
+    else if (stopBroken) status = { txt: "손절가 도달 · 청산 검토", col: "#ff4757" };
+    else if (res.recommendation === "SELL") status = { txt: "신호 약화 · 손절선은 유효 (룰상 보유)", col: "#ffb830" };
+    else status = { txt: "중립 전환 · 손절선 유효", col: "#ffb830" };
+    return { ...res, position: { ...pos, pnlPct, stopBroken, status } };
+  };
 
-    // 과거 기록 저장 (에러 제외, 최근 200개 유지)
+  const saveAnalysisHistory = analyzedResults => {
     const today = new Date().toISOString().slice(0, 10);
-    const newEntries = collected
+    const newEntries = analyzedResults
       .filter(r => !r.error && r.recommendation)
       .map(r => ({
         id: `${r.ticker}_${today}`,
@@ -1044,15 +1134,86 @@ export default function App() {
         entry_zone: r.entry_zone,
         target_price: r.target_price,
         stop_loss: r.stop_loss,
+        analysisMode: r.analysisMode,
       }));
     const merged = [
       ...newEntries,
       ...stateRef.current.history.filter(h => !newEntries.some(e => e.id === h.id)),
     ].slice(0, 200);
+    stateRef.current = { ...stateRef.current, history: merged };
     setHistory(merged);
     syncToGist({ history: merged });
+  };
 
+  const runInputAnalysis = () => {
+    const targets = input.split(/[,\s]+/)
+      .map(ticker => ticker.trim().toUpperCase())
+      .filter(Boolean)
+      .map(ticker => ({ ticker, source: analysisSources[ticker] || "manual" }));
+    runAnalysis(targets);
+  };
+
+  const runAnalysis = async (targets) => {
+    if (!tdKey.trim()) { setError("Twelve Data API 키를 입력해주세요"); return; }
+    if (!anthropicKey.trim()) { setError("Anthropic API 키를 입력해주세요"); return; }
+    const uniqueTargets = [...new Map(targets
+      .map(target => typeof target === "string" ? { ticker: target, source: "manual" } : target)
+      .map(target => ({ ...target, ticker: target.ticker.trim().toUpperCase() }))
+      .filter(target => target.ticker)
+      .map(target => [target.ticker, target])).values()];
+    if (!uniqueTargets.length || analyzing) return;
+    setAnalyzing(true); setError(null); setResults([]); setExpanded(null);
+
+    const collected = [];
+    const priceUpdates = [];
+    for (let i = 0; i < uniqueTargets.length; i++) {
+      const target = uniqueTargets[i];
+      const mode = sourceToMode(target.source);
+      setProgress({ cur: i + 1, total: uniqueTargets.length, sym: target.ticker });
+      try {
+        const heldPos = positions.find(p => p.ticker === target.ticker) || null;
+        const analyzed = await analyzeOne(target.ticker, tdKey.trim(), anthropicKey.trim(), fng, market, sectors, heldPos, mode);
+        collected.push(attachPositionStatus({ ...analyzed, analysisSource: target.source }, target.ticker));
+        if (heldPos) priceUpdates.push({ ticker: target.ticker, currentPrice: analyzed.current_price, priceDate: analyzed.data_date });
+      }
+      catch (e) { collected.push({ ticker: target.ticker, error: true, errMsg: e.message, analysisMode: mode, analysisSource: target.source }); }
+      setResults(sortAnalysisResults(collected));
+      if (i < uniqueTargets.length - 1) await new Promise(r => setTimeout(r, 8500));
+    }
+
+    if (priceUpdates.length) {
+      const updates = new Map(priceUpdates.map(update => [update.ticker, update]));
+      savePositions(stateRef.current.positions.map(position => updates.has(position.ticker)
+        ? { ...position, ...updates.get(position.ticker) }
+        : position));
+    }
+    saveAnalysisHistory(collected);
     setAnalyzing(false);
+  };
+
+  const reanalyzeTicker = async (result, mode) => {
+    if (analyzing || result.analysisMode === mode) return;
+    if (!tdKey.trim() || !anthropicKey.trim()) { setError("API 키를 확인해주세요"); return; }
+    setAnalyzing(true);
+    setError(null);
+    setProgress({ cur: 1, total: 1, sym: result.ticker });
+    try {
+      const heldPos = positions.find(p => p.ticker === result.ticker) || null;
+      const analyzed = await analyzeOne(result.ticker, tdKey.trim(), anthropicKey.trim(), fng, market, sectors, heldPos, mode);
+      const updated = attachPositionStatus({ ...analyzed, analysisSource: "override" }, result.ticker);
+      if (heldPos) {
+        savePositions(stateRef.current.positions.map(position => position.ticker === result.ticker
+          ? { ...position, currentPrice: analyzed.current_price, priceDate: analyzed.data_date }
+          : position));
+      }
+      setResults(prev => sortAnalysisResults(prev.map(item => item.ticker === result.ticker ? updated : item)));
+      saveAnalysisHistory([updated]);
+      setExpanded(result.ticker);
+    } catch (e) {
+      setError(`${result.ticker} 재분석 실패: ${e.message}`);
+    } finally {
+      setAnalyzing(false);
+    }
   };
 
   const recColor = rec => rec === "BUY" ? "#00e5a0" : rec === "SELL" ? "#ff4757" : "#ffb830";
@@ -1066,24 +1227,56 @@ export default function App() {
     return "#ffb830";
   };
 
+  const cashAmount = Number.isFinite(Number(cash)) ? Math.max(0, Number(cash)) : 0;
+  const positionMetrics = positions.map(position => {
+    const shares = Number.isFinite(Number(position.shares)) ? Math.max(0, Number(position.shares)) : 0;
+    const entry = Number.isFinite(Number(position.entry)) ? Number(position.entry) : 0;
+    const hasCurrentPrice = Number.isFinite(Number(position.currentPrice)) && Number(position.currentPrice) > 0;
+    const currentPrice = hasCurrentPrice ? Number(position.currentPrice) : entry;
+    const marketValue = shares * currentPrice;
+    const costBasis = shares * entry;
+    const pnl = marketValue - costBasis;
+    const pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
+    return { ...position, shares, entry, currentPrice, hasCurrentPrice, marketValue, costBasis, pnl, pnlPct };
+  });
+  const stockValue = positionMetrics.reduce((sum, position) => sum + position.marketValue, 0);
+  const totalCostBasis = positionMetrics.reduce((sum, position) => sum + position.costBasis, 0);
+  const totalPnl = positionMetrics.reduce((sum, position) => sum + position.pnl, 0);
+  const totalPnlPct = totalCostBasis > 0 ? (totalPnl / totalCostBasis) * 100 : 0;
+  const totalAssets = cashAmount + stockValue;
+  const cashWeight = totalAssets > 0 ? (cashAmount / totalAssets) * 100 : 0;
+  const formatMoney = value => `$${Number(value || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const formatSignedMoney = value => `${Number(value || 0) >= 0 ? "+" : "-"}$${Math.abs(Number(value || 0)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const priceAgeLabel = date => {
+    if (!date) return "현재가 미갱신";
+    const parsed = new Date(`${date}T00:00:00`);
+    if (Number.isNaN(parsed.getTime())) return "현재가 미갱신";
+    const today = new Date();
+    const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const days = Math.max(0, Math.floor((startToday - parsed) / 86400000));
+    return days === 0 ? "오늘 기준" : `${days}일 전 기준`;
+  };
+
   const counts = results.reduce((a, r) => { if (r.error) a.err++; else a[r.recommendation] = (a[r.recommendation] || 0) + 1; return a; }, { BUY: 0, HOLD: 0, SELL: 0, err: 0 });
 
   const s = {
-    root: { minHeight: "100vh", background: "#070d18", fontFamily: "'Courier New', Courier, monospace", color: "#dce8f5", padding: "24px 14px" },
+    root: { minHeight: "100vh", background: "#070d18", fontFamily: "Pretendard, 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', 'Segoe UI', sans-serif", color: "#dce8f5", padding: "24px 14px", lineHeight: 1.5, wordBreak: "keep-all" },
     wrap: { maxWidth: "820px", margin: "0 auto" },
     head: { textAlign: "center", marginBottom: "22px" },
     title: { fontSize: "23px", fontWeight: "700", letterSpacing: "7px", color: "#00e5a0" },
-    sub: { fontSize: "10px", color: "#334d66", letterSpacing: "3px", marginTop: "6px" },
-    inp: f => ({ width: "100%", boxSizing: "border-box", background: "#0b1522", border: `1px solid ${focused === f ? "#00e5a055" : "#182434"}`, borderRadius: "3px", padding: "12px 15px", color: "#dce8f5", fontSize: "14px", fontFamily: "inherit", letterSpacing: "1px", outline: "none", marginBottom: "9px" }),
-    hint: { fontSize: "9px", color: "#334d66", letterSpacing: "0.5px", marginTop: "-4px", marginBottom: "12px" },
+    sub: { fontSize: "10px", color: "#334d66", letterSpacing: "1.5px", marginTop: "6px" },
+    inp: f => ({ width: "100%", boxSizing: "border-box", background: "#0b1522", border: `1px solid ${focused === f ? "#00e5a055" : "#182434"}`, borderRadius: "3px", padding: "12px 15px", color: "#dce8f5", fontSize: "14px", fontFamily: "inherit", letterSpacing: "0", outline: "none", marginBottom: "9px" }),
+    hint: { fontSize: "9px", color: "#334d66", letterSpacing: "0", marginTop: "-4px", marginBottom: "12px" },
     btnRow: { display: "flex", gap: "8px", marginBottom: "22px" },
-    btn: { flex: 1, background: analyzing ? "#0b1522" : "#00e5a0", color: analyzing ? "#334d66" : "#070d18", border: `1px solid ${analyzing ? "#182434" : "#00e5a0"}`, borderRadius: "3px", padding: "12px", fontSize: "11px", fontWeight: "700", letterSpacing: "2px", cursor: analyzing ? "not-allowed" : "pointer", fontFamily: "inherit" },
-    btn2: { background: "#0b1522", color: "#607d9f", border: "1px solid #182434", borderRadius: "3px", padding: "12px 14px", fontSize: "10px", fontWeight: "700", letterSpacing: "1px", cursor: analyzing ? "not-allowed" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap" },
+    btn: { flex: 1, background: analyzing ? "#0b1522" : "#00e5a0", color: analyzing ? "#334d66" : "#070d18", border: `1px solid ${analyzing ? "#182434" : "#00e5a0"}`, borderRadius: "3px", padding: "12px", fontSize: "11px", fontWeight: "700", letterSpacing: "0.5px", cursor: analyzing ? "not-allowed" : "pointer", fontFamily: "inherit" },
+    btn2: { background: "#0b1522", color: "#607d9f", border: "1px solid #182434", borderRadius: "3px", padding: "12px 14px", fontSize: "10px", fontWeight: "700", letterSpacing: "0.3px", cursor: analyzing ? "not-allowed" : "pointer", fontFamily: "inherit", whiteSpace: "nowrap" },
     card: { background: "#0b1522", border: "1px solid #182434", borderRadius: "3px", padding: "16px 18px", marginBottom: "10px" },
-    lbl: { fontSize: "9px", letterSpacing: "2.5px", color: "#334d66", textTransform: "uppercase", marginBottom: "5px" },
+    lbl: { fontSize: "9px", letterSpacing: "0.8px", color: "#334d66", textTransform: "uppercase", marginBottom: "5px" },
     grid3: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "8px", marginTop: "12px" },
     iCard: { background: "#090e19", border: "1px solid #182434", borderRadius: "3px", padding: "11px" },
     row: { display: "flex", alignItems: "center", gap: "12px", background: "#0b1522", border: "1px solid #182434", borderRadius: "3px", padding: "13px 16px", marginBottom: "8px", cursor: "pointer" },
+    tabBar: { position: "sticky", top: 0, zIndex: 20, display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: "4px", padding: "8px 0", marginBottom: "16px", background: "#070d18" },
+    tab: id => ({ minWidth: 0, background: activeTab === id ? "#00e5a012" : "#0b1522", color: activeTab === id ? "#00e5a0" : "#607d9f", border: `1px solid ${activeTab === id ? "#00e5a055" : "#182434"}`, borderRadius: "3px", padding: "10px 2px", fontSize: "10px", fontWeight: "700", letterSpacing: "0.3px", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }),
   };
 
   return (
@@ -1094,6 +1287,21 @@ export default function App() {
           <div style={s.sub}>실제 데이터 기반 스윙 분석</div>
         </div>
 
+        <div style={s.tabBar}>
+          {[
+            { id: "analyze", label: "분석" },
+            { id: "positions", label: `포지션${positions.length ? ` ${positions.length}` : ""}` },
+            { id: "screener", label: `스크리너${scanResults.length ? ` ${scanResults.length}` : ""}` },
+            { id: "settings", label: "설정" },
+            { id: "glossary", label: "용어" },
+          ].map(tab => (
+            <button key={tab.id} style={s.tab(tab.id)} onClick={() => setActiveTab(tab.id)}>
+              {tab.label}
+            </button>
+          ))}
+        </div>
+
+        {activeTab === "analyze" && (<>
         {fng != null && (() => {
           const lbl = fng <= 25 ? "극공포" : fng <= 45 ? "공포" : fng <= 55 ? "중립" : fng <= 75 ? "탐욕" : "극탐욕";
           const col = fng <= 25 ? "#ff4757" : fng <= 45 ? "#ff8c42" : fng <= 55 ? "#607d9f" : fng <= 75 ? "#7ed957" : "#00e5a0";
@@ -1133,7 +1341,9 @@ export default function App() {
             </div>
           );
         })()}
+        </>)}
 
+        {activeTab === "settings" && (<>
         <input style={s.inp("a")} type="password" value={anthropicKey}
           onChange={e => setAnthropicKey(e.target.value)}
           onFocus={() => setFocused("a")} onBlur={() => setFocused("")}
@@ -1154,90 +1364,100 @@ export default function App() {
             {gistStatus === "connecting" ? "..." : gistStatus === "ok" ? "✓ 연결됨" : gistStatus === "err" ? "✕ 오류" : "연결"}
           </button>
         </div>
+        </>)}
 
-        {/* 계좌 설정 (Gist 연결 시) */}
-        {gistStatus === "ok" && (
-          <div style={{ display: "flex", gap: "6px", marginBottom: "9px", alignItems: "center" }}>
-            <input
-              style={{ ...s.inp("ac"), marginBottom: 0, flex: 1 }}
-              type="number" inputMode="numeric" value={accountSize ?? ""}
-              onChange={e => setAccountSize(e.target.value ? parseFloat(e.target.value) : null)}
-              onFocus={() => setFocused("ac")} onBlur={() => setFocused("")}
-              placeholder="계좌 총액 ($)" />
-            <div style={{ display: "flex", gap: "4px" }}>
+        {/* 자산 및 포지션 사이징 설정 */}
+        {activeTab === "positions" && (
+          <>
+            <div style={{ marginBottom: "8px" }}>
+              <div style={s.lbl}>보유 현금</div>
+              <input
+                style={{ ...s.inp("cash"), marginBottom: 0 }}
+                type="number" inputMode="decimal" min="0" value={cash}
+                onChange={e => setCash(e.target.value === "" ? 0 : Math.max(0, parseFloat(e.target.value) || 0))}
+                onFocus={() => setFocused("cash")} onBlur={() => setFocused("")}
+                placeholder="현금 ($)" />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "12px" }}>
+              <span style={{ fontSize: "9px", color: "#607d9f", marginRight: "2px" }}>거래당 위험</span>
               {[1, 2, 3].map(p => (
                 <button key={p} onClick={() => setRiskPct(p)}
-                  style={{ ...s.btn2, padding: "10px 10px", color: riskPct === p ? "#00e5a0" : "#607d9f", borderColor: riskPct === p ? "#00e5a044" : "#182434", fontSize: "10px" }}>
+                  style={{ ...s.btn2, padding: "8px 12px", color: riskPct === p ? "#00e5a0" : "#607d9f", borderColor: riskPct === p ? "#00e5a044" : "#182434", fontSize: "10px" }}>
                   {p}%
                 </button>
               ))}
+              <span style={{ marginLeft: "auto", fontSize: "8px", color: gistStatus === "ok" ? "#00e5a0" : "#334d66" }}>
+                {gistStatus === "ok" ? "Gist 동기화" : "이 기기에 저장"}
+              </span>
             </div>
-          </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px", marginBottom: "12px" }}>
+              {[
+                { label: "총 자산", value: formatMoney(totalAssets), sub: "현금 + 주식", color: "#dce8f5" },
+                { label: "주식 평가액", value: formatMoney(stockValue), sub: `${totalAssets > 0 ? ((stockValue / totalAssets) * 100).toFixed(1) : "0.0"}%`, color: "#7eb8f7" },
+                { label: "전체 손익", value: formatSignedMoney(totalPnl), sub: `${totalPnlPct >= 0 ? "+" : ""}${totalPnlPct.toFixed(1)}%`, color: totalPnl >= 0 ? "#00e5a0" : "#ff4757" },
+                { label: "현금", value: formatMoney(cashAmount), sub: `${cashWeight.toFixed(1)}%`, color: "#ffb830" },
+              ].map(item => (
+                <div key={item.label} style={s.iCard}>
+                  <div style={s.lbl}>{item.label}</div>
+                  <div style={{ fontSize: "15px", fontWeight: "700", color: item.color, textAlign: "right" }}>{item.value}</div>
+                  <div style={{ fontSize: "8px", color: "#607d9f", textAlign: "right", marginTop: "3px" }}>{item.sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: "8px", color: "#334d66", textAlign: "right", marginTop: "-6px", marginBottom: "12px" }}>
+              주식 {totalAssets > 0 ? ((stockValue / totalAssets) * 100).toFixed(1) : "0.0"}% + 현금 {cashWeight.toFixed(1)}% = {totalAssets > 0 ? "100.0" : "0.0"}%
+            </div>
+          </>
         )}
 
-        <div style={s.hint}>
+        {activeTab === "settings" && <div style={s.hint}>
           API 키는 이 기기에만 저장 · Gist 연결 시 포지션·기록은 GitHub에 동기화
           {(tdKey || anthropicKey) && (
             <span onClick={() => { setTdKey(""); setAnthropicKey(""); try { localStorage.removeItem("wz_tdKey"); localStorage.removeItem("wz_anthropicKey"); } catch {} }}
               style={{ color: "#ff4757", cursor: "pointer", marginLeft: "8px" }}>[키 삭제]</span>
           )}
-        </div>
+        </div>}
 
+        {activeTab === "analyze" && (<>
         <input style={s.inp("tk")} value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={e => e.key === "Enter" && runAnalysis(input.split(/[,\s]+/))}
+          onChange={e => { setInput(e.target.value); setAnalysisSources({}); }}
+          onKeyDown={e => e.key === "Enter" && runInputAnalysis()}
           onFocus={() => setFocused("tk")} onBlur={() => setFocused("")}
           placeholder="티커 입력 (쉼표로 구분: NVDA, AAPL, TSLA)" />
 
-        <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
-          {[
-            { id: "trend", label: "추세 추종" },
-            { id: "reversion", label: "역추세 반등" },
-            { id: "balanced", label: "균형" },
-          ].map(m => (
-            <button key={m.id} onClick={() => setStrategyMode(m.id)} disabled={analyzing}
-              style={{ ...s.btn2, flex: 1, padding: "9px 6px", fontSize: "10px",
-                color: strategyMode === m.id ? "#00e5a0" : "#607d9f",
-                borderColor: strategyMode === m.id ? "#00e5a044" : "#182434",
-                background: strategyMode === m.id ? "#00e5a00a" : "#0b1522" }}>
-              {m.label}
-            </button>
-          ))}
-        </div>
-
         <div style={s.btnRow}>
-          <button style={s.btn} onClick={() => runAnalysis(input.split(/[,\s]+/))} disabled={analyzing}>
+          <button style={s.btn} onClick={runInputAnalysis} disabled={analyzing}>
             {analyzing ? `분석 중 ${progress.cur}/${progress.total} · ${progress.sym}` : "ANALYZE"}
           </button>
-          <button style={s.btn2} onClick={() => setShowPos(v => !v)} disabled={analyzing}>
-            내 포지션 {positions.length > 0 ? `(${positions.length})` : ""} {showPos ? "▴" : "▾"}
-          </button>
-          <button style={{ ...s.btn2, color: showScreener ? "#00e5a0" : "#607d9f", borderColor: showScreener ? "#00e5a044" : "#182434" }}
-            onClick={() => setShowScreener(v => !v)} disabled={analyzing}>
-            스크리너 {scanResults.length > 0 ? `(${scanResults.length})` : ""} {showScreener ? "▴" : "▾"}
-          </button>
         </div>
+        </>)}
 
-        {showPos && (
+        {activeTab === "positions" && (
           <div style={{ ...s.card, padding: "14px 16px" }}>
             <div style={{ ...s.lbl, marginBottom: "10px" }}>보유 종목</div>
             {positions.length === 0 && <div style={{ fontSize: "11px", color: "#334d66", marginBottom: "12px" }}>아직 등록된 보유 종목이 없어요</div>}
-            {positions.map(p => (
+            {positionMetrics.map(p => (
               editingPos === p.ticker ? (
                 <div key={p.ticker} style={{ padding: "10px 0", borderBottom: "1px solid #121c2a" }}>
                   <div style={{ fontWeight: "700", fontSize: "12px", marginBottom: "6px" }}>{p.ticker} 수정</div>
-                  <div style={{ display: "flex", gap: "6px" }}>
-                    <div style={{ flex: 1 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "6px" }}>
+                    <div>
                       <div style={{ fontSize: "8px", color: "#334d66", marginBottom: "2px" }}>진입가</div>
                       <input value={editVals.entry} onChange={e => setEditVals({ ...editVals, entry: e.target.value })}
                         inputMode="decimal" style={{ ...s.inp("e1"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
                     </div>
-                    <div style={{ flex: 1 }}>
+                    <div>
+                      <div style={{ fontSize: "8px", color: "#7eb8f7", marginBottom: "2px" }}>보유 수량</div>
+                      <input value={editVals.shares} onChange={e => setEditVals({ ...editVals, shares: e.target.value })}
+                        inputMode="decimal" type="number" min="0" style={{ ...s.inp("e4"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
+                    </div>
+                    <div>
                       <div style={{ fontSize: "8px", color: "#00e5a0", marginBottom: "2px" }}>목표가</div>
                       <input value={editVals.target} onChange={e => setEditVals({ ...editVals, target: e.target.value })}
                         inputMode="decimal" style={{ ...s.inp("e2"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
                     </div>
-                    <div style={{ flex: 1 }}>
+                    <div>
                       <div style={{ fontSize: "8px", color: "#ff4757", marginBottom: "2px" }}>손절가</div>
                       <input value={editVals.stop} onChange={e => setEditVals({ ...editVals, stop: e.target.value })}
                         inputMode="decimal" style={{ ...s.inp("e3"), marginBottom: 0, fontSize: "12px", padding: "8px 9px" }} />
@@ -1249,38 +1469,71 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div key={p.ticker} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 0", borderBottom: "1px solid #121c2a", fontSize: "11px" }}>
-                  <span style={{ fontWeight: "700", minWidth: "52px" }}>{p.ticker}</span>
-                  <span style={{ flex: 1, color: "#607d9f" }}>
-                    진입 ${p.entry}
-                    {p.target != null ? <span style={{ color: "#00e5a0" }}> · 목표 ${p.target}</span> : ""}
-                    {p.stop != null ? <span style={{ color: "#ff4757" }}> · 손절 ${p.stop}</span> : ""}
-                  </span>
-                  <span onClick={() => startEdit(p)} style={{ color: "#607d9f", cursor: "pointer", padding: "2px 6px", fontSize: "13px" }}>✎</span>
-                  <span onClick={() => removePosition(p.ticker)} style={{ color: "#ff4757", cursor: "pointer", padding: "2px 6px", fontWeight: "700" }}>×</span>
+                <div key={p.ticker} style={{ padding: "12px 0", borderBottom: "1px solid #121c2a" }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", marginBottom: "9px" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "baseline", gap: "7px" }}>
+                        <span style={{ fontWeight: "700", fontSize: "14px" }}>{p.ticker}</span>
+                        <span style={{ fontSize: "9px", color: p.hasCurrentPrice ? "#7eb8f7" : "#ffb830" }}>
+                          ${p.currentPrice.toFixed(2)}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: "8px", color: p.hasCurrentPrice ? "#607d9f" : "#ffb830", marginTop: "2px" }}>
+                        {priceAgeLabel(p.priceDate)}{!p.hasCurrentPrice ? " · 진입가로 임시 계산" : ""}
+                      </div>
+                    </div>
+                    <span onClick={() => startEdit(p)} style={{ color: "#607d9f", cursor: "pointer", padding: "2px 6px", fontSize: "13px" }}>✎</span>
+                    <span onClick={() => removePosition(p.ticker)} style={{ color: "#ff4757", cursor: "pointer", padding: "2px 6px", fontWeight: "700" }}>×</span>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "6px 12px" }}>
+                    <div>
+                      <div style={{ fontSize: "8px", color: "#334d66" }}>평가액 · 비중</div>
+                      <div style={{ fontSize: "11px", color: "#dce8f5", textAlign: "right", marginTop: "2px" }}>
+                        {formatMoney(p.marketValue)} · {totalAssets > 0 ? ((p.marketValue / totalAssets) * 100).toFixed(1) : "0.0"}%
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "8px", color: "#334d66" }}>손익</div>
+                      <div style={{ fontSize: "11px", fontWeight: "700", color: p.pnl >= 0 ? "#00e5a0" : "#ff4757", textAlign: "right", marginTop: "2px" }}>
+                        {formatSignedMoney(p.pnl)} · {p.pnlPct >= 0 ? "+" : ""}{p.pnlPct.toFixed(1)}%
+                      </div>
+                    </div>
+                    <div style={{ fontSize: "9px", color: "#607d9f" }}>
+                      수량 <span style={{ color: p.shares > 0 ? "#dce8f5" : "#ffb830" }}>{p.shares || "미입력"}</span> · 진입 ${p.entry}
+                    </div>
+                    <div style={{ fontSize: "9px", color: "#607d9f", textAlign: "right" }}>
+                      {p.target != null ? <span style={{ color: "#00e5a0" }}>목표 ${p.target}</span> : "목표 —"}
+                      {p.stop != null ? <span style={{ color: "#ff4757" }}> · 손절 ${p.stop}</span> : " · 손절 —"}
+                    </div>
+                  </div>
                 </div>
               )
             ))}
-            <div style={{ display: "flex", gap: "6px", marginTop: "12px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "6px", marginTop: "12px" }}>
               <input value={newPos.ticker} onChange={e => setNewPos({ ...newPos, ticker: e.target.value })}
-                placeholder="티커" style={{ ...s.inp("np1"), marginBottom: 0, flex: "1.1", fontSize: "12px", padding: "9px 10px", textTransform: "uppercase" }} />
+                placeholder="티커" style={{ ...s.inp("np1"), marginBottom: 0, fontSize: "12px", padding: "9px 10px", textTransform: "uppercase" }} />
+              <input value={newPos.shares} onChange={e => setNewPos({ ...newPos, shares: e.target.value })}
+                placeholder="보유 수량" inputMode="decimal" type="number" min="0" style={{ ...s.inp("np5"), marginBottom: 0, fontSize: "12px", padding: "9px 10px" }} />
               <input value={newPos.entry} onChange={e => setNewPos({ ...newPos, entry: e.target.value })}
-                placeholder="진입가" inputMode="decimal" style={{ ...s.inp("np2"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
+                placeholder="진입가" inputMode="decimal" style={{ ...s.inp("np2"), marginBottom: 0, fontSize: "12px", padding: "9px 10px" }} />
               <input value={newPos.target} onChange={e => setNewPos({ ...newPos, target: e.target.value })}
-                placeholder="목표가" inputMode="decimal" style={{ ...s.inp("np4"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
+                placeholder="목표가" inputMode="decimal" style={{ ...s.inp("np4"), marginBottom: 0, fontSize: "12px", padding: "9px 10px" }} />
               <input value={newPos.stop} onChange={e => setNewPos({ ...newPos, stop: e.target.value })}
-                placeholder="손절가" inputMode="decimal" style={{ ...s.inp("np3"), marginBottom: 0, flex: "1", fontSize: "12px", padding: "9px 10px" }} />
+                placeholder="손절가" inputMode="decimal" style={{ ...s.inp("np3"), marginBottom: 0, fontSize: "12px", padding: "9px 10px", gridColumn: "1 / -1" }} />
             </div>
             <div style={{ display: "flex", gap: "6px", marginTop: "8px" }}>
               <button style={{ ...s.btn2, flex: 1 }} onClick={addPosition} disabled={analyzing}>+ 추가</button>
               <button style={{ ...s.btn, flex: 1.5 }} onClick={analyzePositions} disabled={analyzing}>보유 전체 분석</button>
             </div>
-            <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px" }}>※ 이 기기 브라우저에만 저장돼요 (캐시 삭제 시 사라짐)</div>
+            <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px" }}>
+              현재가가 없으면 진입가로 임시 계산합니다 · {gistStatus === "ok" ? "Gist에 동기화됨" : "이 기기 브라우저에 저장됨"}
+            </div>
           </div>
         )}
 
         {/* ── 스크리너 패널 ─────────────────────────────────── */}
-        {showScreener && (
+        {activeTab === "screener" && (
           <div style={{ ...s.card, padding: "14px 16px", marginBottom: "14px" }}>
             <div style={{ ...s.lbl, marginBottom: "12px" }}>종목 스크리너 · S&P 500</div>
 
@@ -1375,74 +1628,114 @@ export default function App() {
                   <div style={{ fontSize: "16px", fontWeight: "700", color: "#00e5a0" }}>{scanResults.length}종목 발굴</div>
                 </div>
 
-                {scanResults.length === 0 ? (
-                  <div style={{ fontSize: "11px", color: "#334d66", marginBottom: "12px" }}>조건을 충족한 종목이 없어요</div>
-                ) : (
-                  <div style={{ marginBottom: "12px" }}>
-                    {/* 헤더 */}
-                    <div style={{ display: "grid", gridTemplateColumns: "70px 36px 1fr 50px 48px 52px", gap: "6px", padding: "4px 0", borderBottom: "1px solid #182434", marginBottom: "4px" }}>
-                      {["티커", "출처", "모드 · 조건", "RSI", "52H%", "거래량"].map(h => (
-                        <div key={h} style={{ fontSize: "8px", color: "#334d66", letterSpacing: "1px" }}>{h}</div>
-                      ))}
-                    </div>
-                    {scanResults.map(c => (
-                      <div key={c.ticker} style={{ display: "grid", gridTemplateColumns: "70px 36px 1fr 50px 48px 52px", gap: "6px", padding: "6px 0", borderBottom: "1px solid #0d1825", alignItems: "center" }}>
-                        <div style={{ fontWeight: "700", fontSize: "12px", color: "#e8f0fe" }}>{c.ticker}</div>
-                        <div style={{ fontSize: "9px", color: c.source === "fixed" ? "#00e5a0" : "#607d9f" }}>
-                          {c.source === "fixed" ? "보유" : "랜덤"}
-                        </div>
-                        <div>
-                          {Object.entries(c.modes).map(([id, m]) => (
-                            <span key={id} style={{ display: "inline-block", marginRight: "4px", marginBottom: "2px", fontSize: "9px", padding: "1px 5px", borderRadius: "2px",
-                              background: id === "A" ? "#00e5a018" : "#ffb83018",
-                              color: id === "A" ? "#00e5a0" : "#ffb830",
-                              border: `1px solid ${id === "A" ? "#00e5a033" : "#ffb83033"}` }}>
-                              {id}:{m.name} {m.count}/{m.total}
-                            </span>
-                          ))}
-                          {c.modes.B?.bonus?.map(tag => (
-                            <span key={tag} style={{ display: "inline-block", marginRight: "3px", marginBottom: "2px", fontSize: "9px", padding: "1px 5px", borderRadius: "2px", background: "#ffffff18", color: "#fff", border: "1px solid #ffffff33" }}>
-                              ★ {tag}
-                            </span>
-                          ))}
-                          <div style={{ fontSize: "8px", color: "#334d66", marginTop: "1px" }}>
-                            {Object.values(c.modes)[0]?.tags.join(" · ")}
-                          </div>
-                        </div>
-                        <div style={{ fontSize: "11px", color: c.rsi >= 50 ? "#e8f0fe" : "#00e5a0" }}>{c.rsi}</div>
-                        <div style={{ fontSize: "11px", color: c.fromH52 >= -5 ? "#ffb830" : "#607d9f" }}>{c.fromH52}%</div>
-                        <div style={{ fontSize: "11px", color: c.volRatio >= 1.5 ? "#00e5a0" : "#607d9f" }}>{c.volRatio}x</div>
-                      </div>
-                    ))}
+                {scanMarketRegime && (
+                  <div style={{
+                    padding: "9px 10px",
+                    marginBottom: "10px",
+                    borderRadius: "6px",
+                    border: `1px solid ${scanMarketRegime.allowModeA ? "#00e5a044" : "#ff475744"}`,
+                    background: scanMarketRegime.allowModeA ? "#00e5a00b" : "#ff47570b",
+                    color: scanMarketRegime.allowModeA ? "#00e5a0" : "#ff7b86",
+                    fontSize: "10px",
+                    lineHeight: "1.6",
+                  }}>
+                    <strong>시장 필터:</strong> {scanMarketRegime.reason}
+                    {scanMarketRegime.gapPct != null && ` (${scanMarketRegime.gapPct >= 0 ? "+" : ""}${Number(scanMarketRegime.gapPct).toFixed(1)}%)`}
+                    <span style={{ color: "#607d9f" }}>
+                      {scanMarketRegime.allowModeA ? " · Mode A 활성" : " · Mode A 신규 추천 중단, Mode B만 유지"}
+                    </span>
                   </div>
                 )}
 
-                {scanResults.length > 0 && (() => {
-                  const modeA = scanResults.filter(c => c.modes.A);
-                  const modeB = scanResults.filter(c => c.modes.B);
-                  const loadTickers = (list) => {
+                {scanResults.length === 0 ? (
+                  <div style={{ fontSize: "11px", color: "#334d66", marginBottom: "12px" }}>조건을 충족한 종목이 없어요</div>
+                ) : (() => {
+                  const modeA = sortModeACandidates(scanResults.filter(c => c.modes.A));
+                  const modeB = scanResults.filter(c => c.modes.B).sort((a, b) => a.ticker.localeCompare(b.ticker));
+                  const selected = scanResultTab === "A" ? modeA : modeB;
+                  const accent = scanResultTab === "A" ? "#00e5a0" : "#ffb830";
+                  const sourceLabel = source => source === "holding" || source === "fixed" ? "보유" : source === "watchlist" ? "관심" : "랜덤";
+                  const loadTickers = (list, modeId) => {
                     setInput(list.map(c => c.ticker).join(", "));
-                    setShowScreener(false);
+                    setAnalysisSources(Object.fromEntries(list.map(c => [c.ticker, modeId])));
+                    setActiveTab("analyze");
                     window.scrollTo({ top: 0, behavior: "smooth" });
                   };
                   return (
-                    <div style={{ display: "flex", gap: "6px", marginBottom: "8px" }}>
-                      {modeA.length > 0 && (
-                        <button style={{ ...s.btn, flex: 1, background: "#00e5a0", color: "#070d18", border: "1px solid #00e5a0", fontSize: "10px" }}
-                          onClick={() => loadTickers(modeA)}>
-                          모드 A 분석<br/><span style={{ fontSize: "9px", opacity: 0.7 }}>추세추종 {modeA.length}종목</span>
-                        </button>
-                      )}
-                      {modeB.length > 0 && (
-                        <button style={{ ...s.btn, flex: 1, background: "#ffb830", color: "#070d18", border: "1px solid #ffb830", fontSize: "10px" }}
-                          onClick={() => loadTickers(modeB)}>
-                          모드 B 분석<br/><span style={{ fontSize: "9px", opacity: 0.7 }}>역추세반등 {modeB.length}종목</span>
-                        </button>
-                      )}
-                      {scanResults.length > 0 && (
-                        <button style={{ ...s.btn2, flex: 1, fontSize: "10px" }}
-                          onClick={() => loadTickers(scanResults)}>
-                          전체<br/><span style={{ fontSize: "9px" }}>{scanResults.length}종목</span>
+                    <div style={{ marginBottom: "12px" }}>
+                      <div style={{ display: "flex", gap: "6px", marginBottom: "10px" }}>
+                        {[
+                          { id: "A", label: "Mode A · 추세추종", count: modeA.length, color: "#00e5a0" },
+                          { id: "B", label: "Mode B · 역추세", count: modeB.length, color: "#ffb830" },
+                        ].map(tab => (
+                          <button key={tab.id} onClick={() => setScanResultTab(tab.id)}
+                            style={{
+                              ...s.btn2,
+                              flex: 1,
+                              padding: "9px 5px",
+                              color: scanResultTab === tab.id ? "#070d18" : tab.color,
+                              background: scanResultTab === tab.id ? tab.color : "#0b1522",
+                              borderColor: `${tab.color}66`,
+                              fontSize: "10px",
+                            }}>
+                            {tab.label}<br/><span style={{ fontSize: "9px", opacity: 0.75 }}>{tab.count}종목</span>
+                          </button>
+                        ))}
+                      </div>
+
+                      {selected.length === 0 ? (
+                        <div style={{ padding: "18px 0", textAlign: "center", color: "#334d66", fontSize: "10px" }}>
+                          이 모드의 통과 종목이 없습니다.
+                        </div>
+                      ) : selected.map((candidate, index) => {
+                        const mode = candidate.modes[scanResultTab];
+                        return (
+                          <div key={`${scanResultTab}-${candidate.ticker}`} style={{
+                            padding: "10px",
+                            marginBottom: "7px",
+                            border: "1px solid #182434",
+                            borderLeft: `3px solid ${accent}`,
+                            borderRadius: "6px",
+                            background: "#0a1320",
+                          }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px" }}>
+                              <div>
+                                <span style={{ fontWeight: "800", fontSize: "14px", color: "#e8f0fe" }}>{candidate.ticker}</span>
+                                <span style={{ marginLeft: "6px", fontSize: "8px", color: candidate.source === "random" ? "#607d9f" : "#00e5a0" }}>
+                                  {sourceLabel(candidate.source)}
+                                </span>
+                                {scanResultTab === "A" && (
+                                  <span style={{ marginLeft: "6px", fontSize: "8px", color: "#607d9f" }}>
+                                    우선순위 {index + 1} · MA20 이격 {Number(candidate.ma20GapPct).toFixed(1)}%
+                                  </span>
+                                )}
+                              </div>
+                              <button style={{ ...s.btn, padding: "6px 12px", fontSize: "9px", background: accent, color: "#070d18", borderColor: accent }}
+                                onClick={() => loadTickers([candidate], scanResultTab)}>
+                                이 종목 분석
+                              </button>
+                            </div>
+                            <div style={{ marginTop: "7px", fontSize: "9px", color: accent }}>
+                              {mode.count}/{mode.total} 충족 · {mode.tags.join(" · ")}
+                            </div>
+                            {scanResultTab === "B" && candidate.modes.B?.bonus?.length > 0 && (
+                              <div style={{ marginTop: "4px", fontSize: "9px", color: "#fff" }}>
+                                ★ {candidate.modes.B.bonus.join(" · ")}
+                              </div>
+                            )}
+                            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "5px", marginTop: "8px", fontSize: "9px", color: "#607d9f" }}>
+                              <span>RSI <b style={{ color: "#e8f0fe" }}>{candidate.rsi}</b></span>
+                              <span>거래량 <b style={{ color: "#e8f0fe" }}>{candidate.volRatio}x</b></span>
+                              <span>52주고점 <b style={{ color: "#e8f0fe" }}>{candidate.fromH52}%</b></span>
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      {selected.length > 0 && (
+                        <button style={{ ...s.btn2, width: "100%", color: accent, borderColor: `${accent}55`, marginTop: "4px" }}
+                          onClick={() => loadTickers(selected, scanResultTab)}>
+                          Mode {scanResultTab} 전체를 분석 탭으로 보내기 ({selected.length}종목)
                         </button>
                       )}
                     </div>
@@ -1459,7 +1752,7 @@ export default function App() {
           </div>
         )}
 
-        {analyzing && (
+        {activeTab === "analyze" && analyzing && (
           <div style={{ height: "2px", background: "#182434", borderRadius: "1px", overflow: "hidden", marginBottom: "20px" }}>
             <div style={{ height: "100%", width: `${(progress.cur / progress.total) * 100}%`, background: "#00e5a0", transition: "width 0.4s ease" }} />
           </div>
@@ -1467,7 +1760,7 @@ export default function App() {
 
         {error && <div style={{ ...s.card, borderColor: "#ff4757", color: "#ff4757", fontSize: "12px" }}>✕ {error}</div>}
 
-        {results.length > 0 && (
+        {activeTab === "analyze" && results.length > 0 && (
           <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
             {[{ k: "BUY", v: counts.BUY, c: "#00e5a0" }, { k: "HOLD", v: counts.HOLD, c: "#ffb830" }, { k: "SELL", v: counts.SELL, c: "#ff4757" }].map(x => (
               <div key={x.k} style={{ flex: 1, background: x.c + "12", border: `1px solid ${x.c}33`, borderRadius: "3px", padding: "10px", textAlign: "center" }}>
@@ -1478,7 +1771,7 @@ export default function App() {
           </div>
         )}
 
-        {results.map((r, idx) => {
+        {activeTab === "analyze" && results.map((r, idx) => {
           if (r.error) return (
             <div key={idx} style={{ ...s.row, cursor: "default", borderColor: "#ff475733" }}>
               <div style={{ fontWeight: "700", fontSize: "15px", minWidth: "70px" }}>{r.ticker}</div>
@@ -1487,16 +1780,27 @@ export default function App() {
           );
           const open = expanded === r.ticker, rc = recColor(r.recommendation);
           const livePos = r.position ? positions.find(p => p.ticker === r.ticker) : null;
+          const modeColor = r.analysisMode === "trend" ? "#00e5a0" : r.analysisMode === "reversion" ? "#ffb830" : "#7eb8f7";
           return (
-            <div key={idx}>
+            <div key={r.ticker}>
               <div style={{ ...s.row, borderColor: open ? rc + "55" : "#182434", marginBottom: open ? 0 : "8px" }} onClick={() => setExpanded(open ? null : r.ticker)}>
-                <div style={{ minWidth: "62px" }}>
+                <div style={{ minWidth: "90px" }}>
                   <div style={{ fontWeight: "700", fontSize: "15px", letterSpacing: "1px" }}>
                     {r.ticker}
                     {r.position && <span style={{ color: r.position.status.col, fontSize: "8px", marginLeft: "5px", border: `1px solid ${r.position.status.col}55`, borderRadius: "2px", padding: "1px 4px", verticalAlign: "middle" }}>보유</span>}
                     {r.earnings && r.earnings.days <= 14 && <span style={{ color: "#ff8c42", fontSize: "10px", marginLeft: "4px" }}>⚠</span>}
                   </div>
                   <div style={{ color: "#334d66", fontSize: "9px" }}>{r.company_name}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "5px" }} onClick={e => e.stopPropagation()}>
+                    <span style={{ fontSize: "7px", color: "#334d66" }}>모드</span>
+                    <select
+                      value={r.analysisMode || "balanced"}
+                      disabled={analyzing}
+                      onChange={e => reanalyzeTicker(r, e.target.value)}
+                      style={{ minWidth: 0, maxWidth: "86px", background: "#090e19", color: modeColor, border: `1px solid ${modeColor}55`, borderRadius: "2px", padding: "2px 3px", fontSize: "8px", fontWeight: "700", fontFamily: "inherit", outline: "none", cursor: analyzing ? "not-allowed" : "pointer" }}>
+                      {ANALYSIS_MODES.map(mode => <option key={mode.id} value={mode.id}>{mode.label}</option>)}
+                    </select>
+                  </div>
                 </div>
                 <div style={{ flex: 1, textAlign: "right" }}>
                   <div style={{ fontSize: "14px", fontWeight: "700" }}>${r.current_price?.toFixed(2)}</div>
@@ -1685,18 +1989,18 @@ export default function App() {
                   )}
 
                   {/* 포지션 사이징 */}
-                  {accountSize && r.stop_loss && r.current_price && (() => {
-                    const riskAmt = accountSize * (riskPct / 100);
+                  {totalAssets > 0 && r.stop_loss && r.current_price && (() => {
+                    const riskAmt = totalAssets * (riskPct / 100);
                     const riskPerShare = r.current_price - r.stop_loss;
                     if (riskPerShare <= 0) return null;
                     const shares = Math.floor(riskAmt / riskPerShare);
                     const invest = shares * r.current_price;
-                    const investPct = (invest / accountSize) * 100;
+                    const investPct = (invest / totalAssets) * 100;
                     const reward = r.target_price ? (r.target_price - r.current_price) * shares : null;
                     const rr = r.target_price ? ((r.target_price - r.current_price) / riskPerShare) : null;
                     return (
                       <div style={{ marginTop: "12px", padding: "12px", borderRadius: "3px", background: "#070d18", border: "1px solid #182434" }}>
-                        <div style={{ ...s.lbl, marginBottom: "8px", color: "#ffb830" }}>포지션 사이징</div>
+                        <div style={{ ...s.lbl, marginBottom: "8px", color: "#ffb830" }}>포지션 사이징 · 총자산 {formatMoney(totalAssets)} 기준</div>
                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px", fontSize: "10px" }}>
                           <div>
                             <div style={{ color: "#334d66", fontSize: "8px", marginBottom: "2px" }}>리스크 한도</div>
@@ -1734,7 +2038,17 @@ export default function App() {
                         e.stopPropagation();
                         if (positions.some(p => p.ticker === r.ticker)) { setError(`${r.ticker}는 이미 보유 목록에 있어요`); return; }
                         setError(null);
-                        savePositions([...positions, { ticker: r.ticker, side: "BUY", entry: r.current_price, stop: r.stop_loss, target: r.target_price, date: new Date().toISOString().slice(0, 10) }]);
+                        savePositions([...positions, {
+                          ticker: r.ticker,
+                          side: "BUY",
+                          entry: r.current_price,
+                          stop: r.stop_loss,
+                          target: r.target_price,
+                          shares: 0,
+                          currentPrice: r.current_price,
+                          priceDate: r.data_date,
+                          date: new Date().toISOString().slice(0, 10),
+                        }]);
                       }}>
                       + 보유 등록 (진입 ${r.current_price?.toFixed(2)} · 손절 ${r.stop_loss})
                     </button>
@@ -1745,32 +2059,48 @@ export default function App() {
           );
         })}
 
-        {history.length > 0 && (
+        {activeTab === "positions" && history.length > 0 && (
           <div style={{ marginTop: "20px" }}>
-            <div style={{ ...s.row, cursor: "pointer", marginBottom: showHistory ? 0 : "8px" }}
-              onClick={() => setShowHistory(v => !v)}>
+            <div style={{ ...s.row, cursor: "default", marginBottom: 0 }}>
               <div style={{ flex: 1, fontSize: "11px", fontWeight: "700", letterSpacing: "1px" }}>과거 분석 기록</div>
               <div style={{ fontSize: "9px", color: "#334d66" }}>{history.length}건</div>
-              <div style={{ color: "#334d66", fontSize: "12px", transform: showHistory ? "rotate(90deg)" : "none", transition: "transform 0.2s" }}>▸</div>
             </div>
-            {showHistory && (
-              <div style={{ ...s.card, borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
-                {history.slice(0, 50).map((h, i) => (
-                  <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 0", borderBottom: "1px solid #121c2a", fontSize: "10px" }}>
-                    <span style={{ color: "#334d66", minWidth: "72px", fontSize: "8px" }}>{h.date}</span>
-                    <span style={{ fontWeight: "700", minWidth: "48px" }}>{h.ticker}</span>
-                    <span style={{ fontSize: "9px", color: "#607d9f", flex: 1 }}>{h.company}</span>
-                    <span style={{ fontWeight: "700", color: h.recommendation === "BUY" ? "#00e5a0" : h.recommendation === "SELL" ? "#ff4757" : "#ffb830", minWidth: "32px", textAlign: "right" }}>{h.recommendation}</span>
-                    <span style={{ color: "#334d66", fontSize: "8px", minWidth: "24px", textAlign: "right" }}>{h.confidence}/10</span>
-                  </div>
-                ))}
-                {history.length > 50 && <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px", textAlign: "center" }}>최근 50건 표시 중 (전체 {history.length}건)</div>}
-              </div>
-            )}
+            <div style={{ ...s.card, borderTop: "none", borderTopLeftRadius: 0, borderTopRightRadius: 0 }}>
+              {history.slice(0, 50).map((h, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 0", borderBottom: "1px solid #121c2a", fontSize: "10px" }}>
+                  <span style={{ color: "#334d66", minWidth: "72px", fontSize: "8px" }}>{h.date}</span>
+                  <span style={{ fontWeight: "700", minWidth: "48px" }}>{h.ticker}</span>
+                  <span style={{ fontSize: "9px", color: "#607d9f", flex: 1 }}>{h.company}</span>
+                  <span style={{ fontWeight: "700", color: h.recommendation === "BUY" ? "#00e5a0" : h.recommendation === "SELL" ? "#ff4757" : "#ffb830", minWidth: "32px", textAlign: "right" }}>{h.recommendation}</span>
+                  <span style={{ color: "#334d66", fontSize: "8px", minWidth: "24px", textAlign: "right" }}>{h.confidence}/10</span>
+                </div>
+              ))}
+              {history.length > 50 && <div style={{ fontSize: "8px", color: "#334d66", marginTop: "8px", textAlign: "center" }}>최근 50건 표시 중 (전체 {history.length}건)</div>}
+            </div>
           </div>
         )}
 
-        {results.length > 0 && (
+        {activeTab === "glossary" && (
+          <div>
+            <div style={{ marginBottom: "14px" }}>
+              <div style={{ fontSize: "15px", fontWeight: "700", color: "#dce8f5", marginBottom: "5px" }}>트레이딩 용어</div>
+              <div style={{ fontSize: "10px", color: "#607d9f", lineHeight: "1.6" }}>앱의 분석과 매매 계획에서 사용하는 핵심 용어입니다.</div>
+            </div>
+            {GLOSSARY.map(item => (
+              <div key={item.term} style={{ ...s.card, padding: "14px 16px" }}>
+                <div style={{ display: "flex", alignItems: "baseline", gap: "8px", flexWrap: "wrap", marginBottom: "7px" }}>
+                  <span style={{ fontSize: "13px", fontWeight: "700", color: "#00e5a0" }}>{item.term}</span>
+                  <span style={{ fontSize: "9px", color: "#607d9f" }}>{item.full}</span>
+                </div>
+                <div style={{ fontSize: "11px", color: "#b5c5d8", lineHeight: "1.65", wordBreak: "keep-all" }}>
+                  {item.desc}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {activeTab === "analyze" && results.length > 0 && (
           <div style={{ textAlign: "center", marginTop: "18px", fontSize: "9px", color: "#1e2e3e", letterSpacing: "1.5px" }}>
             ⚠ 투자 권유가 아닙니다 — 교육 목적의 참고 자료입니다
           </div>

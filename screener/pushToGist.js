@@ -27,6 +27,8 @@ const candidates = (raw.candidates || []).map(c => ({
   rsi: c.snapshot.rsi,
   fromH52: c.snapshot.fromH52,
   volRatio: c.snapshot.volRatio,
+  mfRatio: c.snapshot.mfRatio,
+  ma20GapPct: c.snapshot.ma20GapPct,
   modes: Object.fromEntries(
     Object.entries(c.modeDetails).map(([id, d]) => [
       id,
@@ -45,6 +47,7 @@ const payload = {
   seed: raw.seed,
   candidates,
   stats: raw.universe,
+  marketRegime: raw.marketRegime || candidates[0]?.marketRegime || null,
 };
 
 async function ghReq(method, endpoint, body) {

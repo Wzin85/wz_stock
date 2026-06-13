@@ -65,9 +65,10 @@ export function buildUniverse(watchlist = [], holdings = [], maxSize = 150, seed
   const effectiveSeed = seed !== null ? Number(seed) : Date.now();
   const sampled = sampleN(pool, needed, effectiveSeed);
 
-  // 출처 맵: "fixed" | "random"
+  // 출처 맵: "holding" | "watchlist" | "random"
   const sources = {};
-  for (const t of fixed)   sources[t] = "fixed";
+  for (const t of watchlist.map(ticker => ticker.toUpperCase())) sources[t] = "watchlist";
+  for (const t of holdings.map(ticker => ticker.toUpperCase())) sources[t] = "holding";
   for (const t of sampled) sources[t] = "random";
 
   return {

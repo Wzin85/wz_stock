@@ -13,7 +13,6 @@ export const API_PLAN = {
 export const SCREENER_CONFIG = {
   outputsize: 260,          // 52주 계산에 1년치 필요
   interval: "1day",
-  minPassCount: 4,          // 5개 조건 중 이 개수 이상 충족해야 통과
   universeMaxSize: 150,     // 하루 800 크레딧 여유분 고려한 최대 스캔 수
   apiBaseUrl: "https://api.twelvedata.com",
   retryMaxAttempts: 3,      // 429 발생 시 최대 재시도 횟수
